@@ -109,6 +109,9 @@ diagnostics, search, edit or create files, open files, run commands, and move a
 single explicitly requested file to the system trash. Paths are restricted to
 the workspace. `create_file` does not overwrite an existing file.
 
+`read_file` reads UTF-8 text. Files containing NUL bytes or invalid UTF-8 return
+an error identifying the workspace-relative path instead of their contents.
+
 Use **Stop** to cancel the active request or pending approval. Changes already
 applied before cancellation remain in place.
 
