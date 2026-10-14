@@ -387,7 +387,16 @@ async function listWorkspaceFiles(args: Record<string, unknown>): Promise<string
 async function readFile(args: Record<string, unknown>): Promise<string> {
   const uri = resolveWorkspacePath(args.path);
   const bytes = await vscode.workspace.fs.readFile(uri);
-  const text = new TextDecoder().decode(bytes);
+  const unsupportedMessage = `Cannot read ${vscode.workspace.asRelativePath(uri)}: binary or unsupported file (expected UTF-8 text).`;
+  if (bytes.includes(0)) {
+    throw new Error(unsupportedMessage);
+  }
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(unsupportedMessage);
+  }
   return truncate(text, positiveNumber(args.maxChars, 30000));
 }
 
