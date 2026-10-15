@@ -40,6 +40,8 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   .message.user { padding: 10px 12px; border: 1px solid var(--vscode-panel-border, #ffffff20); border-radius: 8px; background: var(--vscode-editor-background, #1f1f1f); }
   .role { font-size: 10px; font-weight: 650; letter-spacing: .7px; text-transform: uppercase; margin-bottom: 5px; color: var(--vscode-descriptionForeground, #999); }
   .prose { white-space: pre-wrap; }
+  .message-actions { display: flex; align-items: center; gap: 6px; margin-top: 5px; font-size: 11px; }
+  .message-actions button { flex-shrink: 0; }
   .message.error { border-left: 2px solid var(--vscode-errorForeground, #f48771); padding-left: 10px; }
   .error { color: var(--vscode-errorForeground, #f48771); }
   .action { border: 1px solid var(--vscode-panel-border, #ffffff20); border-radius: 7px; margin-bottom: 9px; overflow: hidden; }
@@ -153,6 +155,8 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   const drafts = new Map(Object.entries(saved.drafts || {}));
   const actions = new Map();
   const summaries = new Map();
+  const copies = new Map();
+  let copyRequestId = 0;
   let busy = false, activeSessionId;
   let currentAssistant, currentReasoning, assistantText = '', reasoningText = '', approvalId, failed = false;
   let selectedModel = saved.model || '', selectedBackend = saved.backend, approvalMode = saved.approvalMode || 'safe';
@@ -212,6 +216,32 @@ export function renderChatHtml(webview: { cspSource: string }): string {
         const prose = document.createElement('div'); prose.className = 'prose'; prose.textContent = part; body.append(prose);
       }
     });
+  }
+  function addCopy(body) {
+    const controls = document.createElement('div'); controls.className = 'message-actions';
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'icon'; button.title = 'Copy';
+    button.setAttribute('aria-label', 'Copy assistant message');
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16'); svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const copyPath = 'M5 5h8v9H5zM3 11H1V1h8v2';
+    path.setAttribute('d', copyPath); svg.append(path); button.append(svg);
+    const feedback = document.createElement('span'); feedback.className = 'muted'; feedback.setAttribute('role', 'status');
+    let feedbackTimer;
+    button.addEventListener('click', () => {
+      clearTimeout(feedbackTimer); feedback.textContent = ''; button.disabled = true;
+      path.setAttribute('d', copyPath); button.title = 'Copy';
+      const requestId = String(++copyRequestId);
+      copies.set(requestId, success => {
+        button.disabled = false; feedback.textContent = success ? 'Copied' : 'Copy failed. Try again.';
+        path.setAttribute('d', success ? 'M3 8l3 3 7-7' : copyPath); button.title = success ? 'Copied' : 'Copy';
+        feedbackTimer = setTimeout(() => { feedback.textContent = ''; path.setAttribute('d', copyPath); button.title = 'Copy'; }, 2000);
+      });
+      // Include folded content, excluding the role, code summaries and controls.
+      const text = [...body.querySelectorAll('.prose, pre')].map(node => node.textContent).join('');
+      vscode.postMessage({ type: 'copy', requestId, text });
+    });
+    controls.append(button, feedback); body.parentElement.append(controls);
   }
   function addMessage(role, text, className) {
     const followTail = nearBottom(); welcome.hidden = true;
@@ -308,6 +338,7 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       resizePrompt();
     }
     if (msg.type === 'restore') {
+      copies.clear();
       if (scheduledRender) cancelAnimationFrame(scheduledRender); scheduledRender = undefined;
       currentReasoning = undefined; reasoningText = ''; currentAssistant = undefined; assistantText = '';
       messages.replaceChildren(welcome); welcome.hidden = msg.items.length > 0; actions.clear(); summaries.clear();
@@ -315,7 +346,10 @@ export function renderChatHtml(webview: { cspSource: string }): string {
         if (item.role === 'Tool') addTool(item.text, item.activity);
         else if (item.role === 'Summary') addSummary(item.id || 'restored-' + summaries.size, item.text, false);
         else if (item.role === 'Reasoning') { currentReasoning = undefined; addReasoning(item.text); currentReasoning = undefined; }
-        else addMessage(item.role, item.text);
+        else {
+          const body = addMessage(item.role, item.text);
+          if (item.role === 'DeepLocal' && item.text.trim()) addCopy(body);
+        }
       }
     }
     if (msg.type === 'status') status.textContent = msg.message;
@@ -375,12 +409,16 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       if (reasoningText) addReasoning(reasoningText);
       if (currentAssistant && assistantText) renderBody(currentAssistant, assistantText);
       if (currentAssistant && !assistantText.trim()) currentAssistant.parentElement.remove();
+      if (currentAssistant && assistantText.trim() && !failed && (!msg.outcome || msg.outcome === 'success')) addCopy(currentAssistant);
       setBusy(false); currentAssistant = undefined; currentReasoning = undefined;
       status.textContent = msg.outcome === 'cancelled' ? 'Stopped · Applied changes kept' : failed || msg.outcome === 'error' ? 'Needs attention' : msg.outcome === 'success' ? 'Task completed' : 'Ready';
       remember(); resizePrompt();
     }
     if (msg.type === 'error') { failed = true; addMessage('Needs attention', msg.message, 'error'); status.textContent = 'Needs attention'; }
     if (msg.type === 'notice') addMessage('Note', msg.message);
+    if (msg.type === 'copyResult') {
+      copies.get(msg.requestId)?.(msg.success === true); copies.delete(msg.requestId);
+    }
   });
   send.addEventListener('click', () => {
     const text = prompt.value.trim(); if (busy || !text || !model.value) return;

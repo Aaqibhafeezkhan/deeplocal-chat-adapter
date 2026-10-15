@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from 'vitest';
-import * as path from 'node:path';
+import { posix as path } from 'node:path';
 import { invokeAgentTool, toolResultsToMessages } from '../../src/agent-tools';
 
 const env = vi.hoisted(() => ({ readFile: vi.fn() }));
