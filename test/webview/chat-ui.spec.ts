@@ -95,8 +95,72 @@ test('shows concise progress before its operation and keeps it collapsible', asy
   await dispatch(page, { type: 'assistantFinal', text: 'The configuration is ready.' });
   await dispatch(page, { type: 'assistantDone', outcome: 'success' });
   await expect(page.locator('.reasoning')).toHaveCount(1);
-  await expect(page.locator('.assistant')).toHaveText('AgentThe configuration is ready.');
+  await expect(page.locator('.assistant .prose')).toHaveText('The configuration is ready.');
   await expect(page.locator('.reasoning')).not.toContainText('The configuration is ready.');
+});
+
+test('copies complete rendered replies with folded code, keyboard access and feedback', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 260, height: 820 });
+  const copy = page.getByRole('button', { name: 'Copy assistant message', exact: true });
+  await dispatch(page, { type: 'assistantStart' });
+  await expect(copy).toHaveCount(0);
+  const text = 'Run this:\n```ts\nconsole.log("<safe>");\n```\nThen continue.\n' + 'Long answer. '.repeat(150);
+  await dispatch(page, { type: 'assistantDelta', text });
+  await expect(page.locator('.code')).toHaveCount(2);
+  await expect(copy).toHaveCount(0);
+  await dispatch(page, { type: 'assistantFinal', text });
+  await expect(copy).toHaveCount(0);
+  await dispatch(page, { type: 'assistantDone', outcome: 'success' });
+  await expect(copy).toBeVisible();
+  await expect(copy).toHaveAttribute('title', 'Copy');
+  await expect(copy).toHaveText('');
+  await expect(copy.locator('svg')).toHaveAttribute('aria-hidden', 'true');
+  const copyPath = await copy.locator('path').getAttribute('d');
+  await page.getByRole('button', { name: 'Settings', exact: true }).focus();
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  await expect(copy).toBeFocused();
+  await page.keyboard.press('Enter');
+  const request = await page.evaluate(() => window.__messages.at(-1));
+  expect(request).toMatchObject({ type: 'copy', text: text.replace('```ts\n', '').replace('```', '') });
+  await expect(copy).toBeDisabled();
+  await expect(page.locator('.message-actions [role="status"]')).toBeEmpty();
+  await dispatch(page, { type: 'copyResult', requestId: request!.requestId, success: true });
+  await expect(copy).toBeEnabled();
+  await expect(page.locator('.message-actions [role="status"]')).toHaveText('Copied');
+  await expect(copy).toHaveAttribute('title', 'Copied');
+  await expect(copy.locator('path')).toHaveAttribute('d', 'M3 8l3 3 7-7');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('copy-completed-narrow.png') });
+  await expect(page.locator('.message-actions [role="status"]')).toBeEmpty();
+  await expect(copy.locator('path')).toHaveAttribute('d', copyPath!);
+  await expect(copy).toHaveAttribute('title', 'Copy');
+  // Earlier replies remain copyable while the next reply is streaming.
+  await dispatch(page, { type: 'assistantStart' });
+  await copy.press('Space');
+  const retry = await page.evaluate(() => window.__messages.at(-1));
+  await dispatch(page, { type: 'copyResult', requestId: retry!.requestId, success: false });
+  await expect(page.locator('.message-actions [role="status"]')).toHaveText('Copy failed. Try again.');
+  await expect(copy.locator('path')).toHaveAttribute('d', copyPath!);
+  await expect(copy).toBeEnabled();
+});
+
+test('only completed answers get Copy controls and restored answers retain them', async ({ page }) => {
+  const copy = page.getByRole('button', { name: 'Copy assistant message', exact: true });
+  for (const outcome of ['cancelled', 'error', 'success']) {
+    await dispatch(page, { type: 'assistantStart' });
+    if (outcome !== 'success') await dispatch(page, { type: 'assistantDelta', text: 'Partial answer' });
+    await dispatch(page, { type: 'assistantDone', outcome });
+    await expect(copy).toHaveCount(0);
+  }
+  await dispatch(page, { type: 'restore', items: [
+    { role: 'You', text: 'Question' }, { role: 'Reasoning', text: 'Thinking' },
+    { role: 'DeepLocal', text: 'Saved answer' }, { role: 'DeepLocal', text: '' },
+  ] });
+  await expect(copy).toHaveCount(1);
+  await copy.click();
+  expect(await page.evaluate(() => window.__messages.at(-1))).toMatchObject({ type: 'copy', text: 'Saved answer' });
 });
 
 test('preserves model selection, exposes agent modes, and does not submit IME composition', async ({ page }) => {

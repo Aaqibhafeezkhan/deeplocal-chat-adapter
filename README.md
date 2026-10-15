@@ -30,6 +30,7 @@ To quickly test the extension during development:
 - Choose an approval mode: approve every operation, automatically allow safe
   operations, allow all operations, or use discussion-only mode.
 - View streamed progress updates, tool activity, and final answers separately.
+- Copy completed assistant answers, including folded code, using the copy icon below each reply. A checkmark and “Copied” confirm success briefly.
 - Use the Responses API with compatible endpoints to display provider reasoning
   summaries separately from the answer.
 - Keep recent chat sessions per workspace across webview recreation and reloads.

@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { Script } from 'node:vm';
-import * as path from 'node:path';
+import { posix as path } from 'node:path';
 import { ChatPanel } from '../../src/chat-panel';
 import { invokeAgentTool } from '../../src/agent-tools';
 import { ChatCompletionRequest, StreamEvent } from '../../src/protocol';
@@ -9,6 +9,7 @@ import { toolActivity } from '../../src/tool-activity';
 const env = vi.hoisted(() => ({
   files: new Map<string, string>(), dirty: false, version: 1,
   apply: vi.fn(), show: vi.fn(), dispose: vi.fn(), command: vi.fn(), trash: vi.fn(),
+  clipboard: vi.fn(),
   config: { injectSystemPrompt: true, agentMaxTurns: 3, maxOutputTokens: 1000, backend: 'local', approvalMode: 'every' },
 }));
 
@@ -22,7 +23,7 @@ vi.mock('vscode', () => {
     replace(target: { fsPath: string }, _range: unknown, text: string) { this.operations.push({ kind: 'write', target, text }); }
   }
   return {
-    env: { language: 'en' },
+    env: { language: 'en', clipboard: { writeText: env.clipboard } },
     FileType: { File: 1, Directory: 2 },
     Uri: { parse: uri, joinPath: (root: { fsPath: string }, relative: string) => uri(path.resolve(root.fsPath, relative)) },
     WorkspaceEdit, Position: class {}, Range: class {},
@@ -191,6 +192,17 @@ function panelHarness(responses: StreamEvent[][]) {
   panel.resolveWebviewView({ webview, onDidDispose: () => {} } as never);
   return { sent, requests, state, webview, client, send: (message: unknown) => receive(message) };
 }
+
+it('writes webview copy requests to the VS Code clipboard and reports the result', async () => {
+  const harness = panelHarness([]);
+  env.clipboard.mockResolvedValueOnce(undefined);
+  harness.send({ type: 'copy', requestId: 'one', text: 'Complete answer\nconsole.log("safe");' });
+  await vi.waitFor(() => expect(harness.sent).toContainEqual({ type: 'copyResult', requestId: 'one', success: true }));
+  expect(env.clipboard).toHaveBeenCalledWith('Complete answer\nconsole.log("safe");');
+  env.clipboard.mockRejectedValueOnce(new Error('Clipboard unavailable'));
+  harness.send({ type: 'copy', requestId: 'two', text: 'Retry' });
+  await vi.waitFor(() => expect(harness.sent).toContainEqual({ type: 'copyResult', requestId: 'two', success: false }));
+});
 
 const tool: StreamEvent = { kind: 'toolCall', value: {
   id: 'c1', type: 'function', function: { name: 'create_file', arguments: createArgs },

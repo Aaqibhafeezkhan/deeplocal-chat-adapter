@@ -8,7 +8,8 @@ import { renderChatHtml } from './chat-webview';
 import { toolActivity, ToolActivity } from './tool-activity';
 
 interface WebviewMessage {
-  type: 'ready' | 'send' | 'stop' | 'approval' | 'preview' | 'refreshModels' | 'newSession' | 'switchSession' | 'deleteSession' | 'setBackend' | 'setRemoteApiKey' | 'clearRemoteApiKey' | 'setApiMode' | 'setSummary' | 'setApprovalMode';
+  type: 'ready' | 'send' | 'stop' | 'approval' | 'preview' | 'refreshModels' | 'newSession' | 'switchSession' | 'deleteSession' | 'setBackend' | 'setRemoteApiKey' | 'clearRemoteApiKey' | 'setApiMode' | 'setSummary' | 'setApprovalMode' | 'copy';
+  requestId?: string;
   apiMode?: 'chat-completions' | 'responses';
   summary?: 'off' | 'auto';
   approvalMode?: 'every' | 'safe' | 'full' | 'ask';
@@ -97,6 +98,15 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private async handleMessage(message: WebviewMessage): Promise<void> {
+    if (message.type === 'copy' && typeof message.text === 'string' && typeof message.requestId === 'string') {
+      try {
+        await vscode.env.clipboard.writeText(message.text);
+        this.post({ type: 'copyResult', requestId: message.requestId, success: true });
+      } catch {
+        this.post({ type: 'copyResult', requestId: message.requestId, success: false });
+      }
+      return;
+    }
     if (message.type === 'stop') { this.stopTask(); return; }
     if (message.type === 'approval' || message.type === 'preview') {
       const pending = this.pendingApproval;
