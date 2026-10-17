@@ -319,7 +319,7 @@ function getSelection(args: Record<string, unknown>): string {
 
 function getDiagnostics(args: Record<string, unknown>): string {
   const maxResults = boundedNumber(args.maxResults, 80, MAX_RESULT_COUNT);
-  const target =typeof args.path === 'string' && args.path.trim()
+  const target = typeof args.path === 'string' && args.path.trim()
     ? resolveWorkspacePath(args.path)
     : undefined;
   const entries = target
