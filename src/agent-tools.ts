@@ -8,6 +8,10 @@ import { ApprovalMode } from './config';
 
 const execFileAsync = promisify(execFile);
 
+// Upper bounds for caller-supplied limits; defaults sit below these.
+const MAX_TEXT_CHARS = 60000;
+const MAX_RESULT_COUNT = 500;
+
 export interface AgentToolResult {
   callId: string;
   name: string;
@@ -310,11 +314,11 @@ function getSelection(args: Record<string, unknown>): string {
   if (editor.selection.isEmpty) {
     return 'No selected text.';
   }
-  return truncate(editor.document.getText(editor.selection), positiveNumber(args.maxChars, 20000));
+  return truncate(editor.document.getText(editor.selection), boundedNumber(args.maxChars, 20000, MAX_TEXT_CHARS));
 }
 
 function getDiagnostics(args: Record<string, unknown>): string {
-  const maxResults = positiveNumber(args.maxResults, 80);
+  const maxResults = boundedNumber(args.maxResults, 80, MAX_RESULT_COUNT);
   const target = typeof args.path === 'string' && args.path.trim()
     ? resolveWorkspacePath(args.path)
     : undefined;
@@ -379,7 +383,7 @@ function resolveWorkspacePath(input: unknown): vscode.Uri {
 
 async function listWorkspaceFiles(args: Record<string, unknown>): Promise<string> {
   const pattern = typeof args.pattern === 'string' && args.pattern.trim() ? args.pattern : '**/*';
-  const maxResults = positiveNumber(args.maxResults, 200);
+  const maxResults = boundedNumber(args.maxResults, 200, MAX_RESULT_COUNT);
   const files = await vscode.workspace.findFiles(pattern, '**/{node_modules,.git,dist,out}/**', maxResults);
   return files.map((file) => vscode.workspace.asRelativePath(file)).join('\n') || '(no files)';
 }
@@ -397,7 +401,7 @@ async function readFile(args: Record<string, unknown>): Promise<string> {
   } catch {
     throw new Error(unsupportedMessage);
   }
-  return truncate(text, positiveNumber(args.maxChars, 30000));
+  return truncate(text, boundedNumber(args.maxChars, 30000, MAX_TEXT_CHARS));
 }
 
 async function searchWorkspace(args: Record<string, unknown>): Promise<string> {
@@ -406,7 +410,7 @@ async function searchWorkspace(args: Record<string, unknown>): Promise<string> {
     throw new Error('query is required.');
   }
 
-  const maxResults = positiveNumber(args.maxResults, 80);
+  const maxResults = boundedNumber(args.maxResults, 80, MAX_RESULT_COUNT);
   const files = await vscode.workspace.findFiles('**/*', '**/{node_modules,.git,dist,out}/**', 500);
   const hits: string[] = [];
 
@@ -559,6 +563,11 @@ function result(callId: string, name: string, content: string, status: AgentTool
 
 function positiveNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** Caller-supplied limits may be smaller than the cap but never larger. */
+function boundedNumber(value: unknown, fallback: number, max: number): number {
+  return Math.min(positiveNumber(value, fallback), max);
 }
 
 function truncate(text: string, maxChars: number): string {
