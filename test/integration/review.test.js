@@ -128,7 +128,7 @@ suite('Read-only review with real Git and VS Code documents', () => {
     active.send({ type: 'openReviewReference', reportId: result.id, findingIndex: 0 });
     const editor = await waitFor(() => {
       const candidate = vscode.window.activeTextEditor;
-      return candidate?.document.uri.scheme.startsWith('deeplocal-review-') && candidate;
+      return candidate?.document.uri.scheme === 'deeplocal-review' && candidate;
     }, 'review source document');
     assert.equal(editor.document.getText(), staged);
     assert.notEqual(vscode.workspace.fs.isWritableFileSystem(editor.document.uri.scheme), true);
