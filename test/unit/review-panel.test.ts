@@ -24,7 +24,7 @@ vi.mock('vscode', () => ({
     registerTextDocumentContentProvider: (scheme: string, provider: { provideTextDocumentContent: () => string }) => {
       env.providers.set(scheme, provider); return { dispose: vi.fn() };
     },
-    openTextDocument: async (uri: { scheme: string }) => ({ uri, getText: env.providers.get(uri.scheme)?.provideTextDocumentContent }),
+    openTextDocument: async (uri: { scheme: string; toString: () => string }) => ({ uri, getText: () => env.providers.get(uri.scheme)?.provideTextDocumentContent(uri) }),
   },
 }));
 
@@ -175,7 +175,11 @@ it('copies only the stored report and opens its historical snapshot through a re
   h.send({ type: 'openReviewReference', reportId, findingIndex: 0 });
   await vi.waitFor(() => expect(env.show).toHaveBeenCalledOnce());
   expect(env.show.mock.calls[0][0].getText()).toBe('reviewed historical content\n');
+  h.send({ type: 'openReviewReference', reportId, findingIndex: 0 });
+  await vi.waitFor(() => expect(env.show).toHaveBeenCalledTimes(2));
+  expect(env.providers.size).toBe(1);
+  expect(env.show.mock.calls[1][0].getText()).toBe('reviewed historical content\n');
   h.send({ type: 'openReviewReference', reportId, findingIndex: 200 });
   h.send({ type: 'openReviewReference', reportId: 'forged', findingIndex: 0 });
-  expect(env.show).toHaveBeenCalledOnce();
+  expect(env.show).toHaveBeenCalledTimes(2);
 });
