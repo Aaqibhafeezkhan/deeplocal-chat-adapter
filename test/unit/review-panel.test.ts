@@ -6,7 +6,7 @@ const env = vi.hoisted(() => ({
   git: vi.fn(), run: vi.fn(), confirm: vi.fn(), show: vi.fn(), clipboard: vi.fn(),
   folders: [{ name: 'project', index: 0, uri: { scheme: 'file', fsPath: '/project', toString: () => 'file:///project' } }],
   foldersChanged: (_event: unknown) => {},
-  providers: new Map<string, { provideTextDocumentContent: () => string }>(),
+  providers: new Map<string, { provideTextDocumentContent: (uri: { toString: () => string }) => string }>(),
   config: { approvalMode: 'full', agentMaxTurns: 3, maxOutputTokens: 1000 },
 }));
 
@@ -21,7 +21,7 @@ vi.mock('vscode', () => ({
   workspace: {
     get workspaceFolders() { return env.folders; },
     onDidChangeWorkspaceFolders: (callback: typeof env.foldersChanged) => { env.foldersChanged = callback; return { dispose: vi.fn() }; },
-    registerTextDocumentContentProvider: (scheme: string, provider: { provideTextDocumentContent: () => string }) => {
+    registerTextDocumentContentProvider: (scheme: string, provider: { provideTextDocumentContent: (uri: { toString: () => string }) => string }) => {
       env.providers.set(scheme, provider); return { dispose: vi.fn() };
     },
     openTextDocument: async (uri: { scheme: string; toString: () => string }) => ({ uri, getText: () => env.providers.get(uri.scheme)?.provideTextDocumentContent(uri) }),
