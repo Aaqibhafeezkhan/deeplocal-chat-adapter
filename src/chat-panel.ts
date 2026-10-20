@@ -65,6 +65,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private pendingApproval: { id: string; resolve: (approved: boolean) => void; preview?: () => Promise<void> } | undefined;
   private persistTimer: ReturnType<typeof setTimeout> | undefined;
   private view: vscode.WebviewView | undefined;
+  private readonly reviewDocuments = new Map<string, string>();
   private readonly scopedSessionsKey = `${ChatPanel.sessionsKey}.${workspaceIdentity()}`;
   private readonly scopedActiveSessionKey = `${ChatPanel.activeSessionKey}.${workspaceIdentity()}`;
 
@@ -88,6 +89,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       }
       this.postWorkspace();
     }));
+    this.context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('deeplocal-review', {
+      provideTextDocumentContent: uri => this.reviewDocuments.get(uri.toString()) ?? '',
+    }));
+    this.context.subscriptions.push({ dispose: () => this.reviewDocuments.clear() });
     this.sessions = this.loadSessions().map(repairTranscript);
     this.activeSessionId = this.context.workspaceState.get<string>(this.scopedActiveSessionKey, this.sessions[0].id);
     if (!this.sessions.some((session) => session.id === this.activeSessionId)) {
@@ -406,10 +411,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const source = report.sources.find(item => item.path === finding.path && item.side === finding.side);
     if (!source) return;
     // A content provider opens the reviewed snapshot, never the mutable checkout.
-    const scheme = `deeplocal-review-${createId()}`;
-    const uri = vscode.Uri.parse(`${scheme}:/${finding.path.split('/').map(encodeURIComponent).join('/')}?${finding.side}`);
-    const provider = vscode.workspace.registerTextDocumentContentProvider(scheme, { provideTextDocumentContent: () => source.content });
-    this.context.subscriptions.push(provider);
+    const uri = vscode.Uri.parse(`deeplocal-review:/${finding.path.split('/').map(encodeURIComponent).join('/')}?side=${finding.side}&snapshot=${createId()}`);
+    const key = uri.toString();
+    this.reviewDocuments.set(key, source.content);
+    // Keep recent snapshots available without registering a provider for each navigation.
+    if (this.reviewDocuments.size > 128) {
+      const oldest = this.reviewDocuments.keys().next().value;
+      if (oldest !== undefined) this.reviewDocuments.delete(oldest);
+    }
     try {
       const document = await vscode.workspace.openTextDocument(uri);
       await vscode.window.showTextDocument(document, {
@@ -417,7 +426,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         selection: new vscode.Range(finding.startLine - 1, 0, finding.endLine - 1, 0),
       });
     } catch (error) {
-      provider.dispose();
+      this.reviewDocuments.delete(key);
       throw error;
     }
   }
