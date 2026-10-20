@@ -1,6 +1,169 @@
 import { test, expect, Page } from '@playwright/test';
 import { renderChatHtml } from '../../src/chat-webview';
 
+const reviewReport = {
+  summary: 'Review completed.', label: 'HEAD~1..HEAD', testsRun: false, limitations: ['Only the selected changes were reviewed.'],
+  sources: [{ path: 'src/old.ts', side: 'base', content: 'const unsafe = true;\n' }],
+  findings: [{ title: 'Unsafe default', severity: 'High', classification: 'confirmed', explanation: 'The default bypasses the guard.',
+    evidence: 'const unsafe = true;', path: 'src/old.ts', side: 'base', startLine: 1, endLine: 1 }],
+};
+
+test('review workflow waits for host confirmation and keeps permissions separate', async ({ page }) => {
+  await page.locator('#prompt').fill('Check the guard');
+  await page.getByRole('combobox', { name: 'Workflow', exact: true }).selectOption('review');
+  expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'setWorkflow', workflow: 'review' });
+  await expect(page.locator('#workflow')).toHaveValue('normal');
+  await expect(page.locator('#workflow')).toBeDisabled();
+  await expect(page.locator('#send')).toBeDisabled();
+  await expect(page.locator('#reviewOptions')).toBeHidden();
+  await dispatch(page, { type: 'workflow', workflow: 'review' });
+  await expect(page.locator('#workflow')).toHaveValue('review');
+  await expect(page.locator('#permissionMode')).toBeHidden();
+  await expect(page.locator('#permissionMode')).toBeDisabled();
+  await expect(page.locator('#modeHint')).toContainText('Read-only review');
+  await page.locator('#workflow').selectOption('normal');
+  await expect(page.locator('#workflow')).toHaveValue('review');
+  await expect(page.locator('#send')).toBeDisabled();
+  // Host declined leaving review, so no editing mode becomes authoritative.
+  await dispatch(page, { type: 'workflow', workflow: 'review' });
+  await expect(page.locator('#workflow')).toBeEnabled();
+  await expect(page.locator('#permissionMode')).toBeHidden();
+  await page.locator('#workflow').selectOption('normal');
+  await dispatch(page, { type: 'workflow', workflow: 'normal' });
+  await expect(page.locator('#permissionMode')).toBeVisible();
+  await expect(page.locator('#permissionMode')).toBeEnabled();
+  await expect(page.locator('#prompt')).toHaveValue('Check the guard');
+});
+
+test('review accepts empty focus with selected changes while normal tasks require text', async ({ page }) => {
+  await expect(page.locator('#send')).toBeDisabled();
+  await dispatch(page, { type: 'workflow', workflow: 'review' });
+  await expect(page.getByRole('textbox', { name: 'Review focus (optional)', exact: true })).toBeVisible();
+  await expect(page.locator('#reviewSource')).toHaveValue('unstaged');
+  await expect(page.locator('#reviewCommits')).toBeHidden();
+  await page.getByRole('button', { name: 'Review changes', exact: true }).click();
+  expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'send', text: '', model: 'gpt-6-luna', review: { source: 'unstaged' } });
+  await dispatch(page, { type: 'assistantDone', outcome: 'success', review: true });
+  await page.locator('#reviewSource').selectOption('staged');
+  await page.locator('#prompt').fill('Check error handling');
+  await page.locator('#send').click();
+  expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'send', text: 'Check error handling', model: 'gpt-6-luna', review: { source: 'staged' } });
+});
+
+test('commit review fields fit narrow widths and submit the exact ref inputs', async ({ page }, testInfo) => {
+  await dispatch(page, { type: 'workflow', workflow: 'review' });
+  await page.locator('#reviewSource').selectOption('commits');
+  await expect(page.getByRole('textbox', { name: 'Base ref', exact: true })).toHaveValue('HEAD~1');
+  await expect(page.getByRole('textbox', { name: 'Target ref', exact: true })).toHaveValue('HEAD');
+  for (const width of [260, 340, 480]) {
+    await page.setViewportSize({ width, height: 820 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await expect(page.locator('#reviewBase')).toBeInViewport();
+    await expect(page.locator('#send')).toBeInViewport();
+  }
+  await page.setViewportSize({ width: 260, height: 820 });
+  await page.locator('#reviewBase').fill('main');
+  await page.locator('#reviewTarget').fill('feature/guard');
+  await page.screenshot({ path: testInfo.outputPath('code-review-commit-narrow.png') });
+  await page.locator('#prompt').press('Enter');
+  expect(await page.evaluate(() => window.__messages.at(-1))).toMatchObject({ type: 'send', text: '', review: { source: 'commits', base: 'main', target: 'feature/guard' } });
+});
+
+test('review locks workflow and source controls while running and stops without edit claims', async ({ page }) => {
+  await dispatch(page, { type: 'workflow', workflow: 'review' });
+  await page.locator('#reviewSource').selectOption('commits');
+  await dispatch(page, { type: 'assistantStart', agent: true, review: true });
+  for (const id of ['workflow', 'reviewSource', 'reviewBase', 'reviewTarget', 'model']) await expect(page.locator('#' + id)).toBeDisabled();
+  await expect(page.locator('#modeHint')).toContainText('Reviewing changes');
+  await expect(page.locator('#prompt')).toBeEnabled();
+  await dispatch(page, { type: 'status', message: 'Reading the selected diff…' });
+  await expect(page.locator('#status')).toHaveText('Reading the selected diff…');
+  await expect(page.locator('.assistant, .reasoning, .action')).toHaveCount(0);
+  await page.locator('#stop').click();
+  expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'stop' });
+  await dispatch(page, { type: 'assistantDone', outcome: 'cancelled', review: true });
+  await expect(page.locator('#status')).toHaveText('Review stopped');
+  await expect(page.locator('#status')).not.toContainText('Applied');
+  for (const id of ['workflow', 'reviewSource', 'reviewBase', 'reviewTarget']) await expect(page.locator('#' + id)).toBeEnabled();
+  await expect(page.locator('#permissionMode')).toBeDisabled();
+});
+
+test('dedicated review reports open host references and copy PR summaries with feedback', async ({ page }, testInfo) => {
+  await dispatch(page, { type: 'workflow', workflow: 'review' });
+  await dispatch(page, { type: 'assistantStart', agent: true, review: true });
+  const text = '## Confirmed findings\nHigh: Unsafe default\n\n## Potential risks\nNone reported.\n\nTests were not run.';
+  await dispatch(page, { type: 'reviewResult', id: 'report-1', text, report: reviewReport });
+  await dispatch(page, { type: 'assistantDone', outcome: 'success', review: true });
+  const card = page.locator('.review-report');
+  await expect(card).toContainText('Confirmed findings');
+  await expect(card).toContainText('Potential risks');
+  await expect(card.getByRole('heading', { name: 'High: Unsafe default', exact: true })).toBeVisible();
+  await expect(card.locator('pre')).toHaveText('const unsafe = true;');
+  await expect(card).toContainText('Tests were not run. This was a read-only review.');
+  await page.setViewportSize({ width: 260, height: 980 });
+  await page.screenshot({ path: testInfo.outputPath('code-review-report-narrow.png') });
+  await expect(page.locator('#status')).toHaveText('Review completed');
+  await expect(page.getByRole('button', { name: 'Copy assistant message', exact: true })).toHaveCount(0);
+  await card.getByRole('button', { name: 'Open src/old.ts:1 (base)', exact: true }).click();
+  expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'openReviewReference', reportId: 'report-1', findingIndex: 0 });
+  const copy = card.getByRole('button', { name: 'Copy PR summary', exact: true });
+  await copy.focus(); await page.keyboard.press('Enter');
+  const request = await page.evaluate(() => window.__messages.at(-1));
+  expect(request).toEqual({ type: 'copyReview', reportId: 'report-1', requestId: expect.any(String) });
+  await expect(copy).toBeDisabled();
+  await dispatch(page, { type: 'copyResult', requestId: request!.requestId, success: false });
+  await expect(card.locator('.message-actions [role="status"]')).toHaveText('Copy failed. Try again.');
+  await copy.click();
+  const retry = await page.evaluate(() => window.__messages.at(-1));
+  expect(retry!.requestId).not.toBe(request!.requestId);
+  await dispatch(page, { type: 'copyResult', requestId: retry!.requestId, success: true });
+  await expect(card.locator('.message-actions [role="status"]')).toHaveText('Copied');
+  await expect(copy).toBeEnabled();
+});
+
+test('restored review reports retain safe references without executing HTML or creating model links', async ({ page }) => {
+  const unsafe = '<img src=x onerror="window.compromised=true"> [execute](command:evil)';
+  const report = { ...reviewReport, summary: unsafe, findings: [{ ...reviewReport.findings[0], title: unsafe, evidence: unsafe, path: unsafe }] };
+  await dispatch(page, { type: 'workflow', workflow: 'review' });
+  await dispatch(page, { type: 'restore', items: [{ id: 'saved-review', role: 'DeepLocal', text: unsafe, reviewReport: report }] });
+  const card = page.locator('.review-report');
+  await expect(card.locator('.review-summary')).toHaveText(unsafe);
+  await expect(card.locator('h3')).toHaveText('High: ' + unsafe);
+  await expect(card.locator('pre')).toHaveText(unsafe);
+  await expect(card.locator('a, img, script')).toHaveCount(0);
+  expect(await page.evaluate(() => 'compromised' in window)).toBe(false);
+  await card.locator('.review-references button').click();
+  expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'openReviewReference', reportId: 'saved-review', findingIndex: 0 });
+  await card.getByRole('button', { name: 'Copy PR summary', exact: true }).click();
+  expect(await page.evaluate(() => window.__messages.at(-1))).toMatchObject({ type: 'copyReview', reportId: 'saved-review' });
+});
+
+test('long structured reports show every finding without folding the whole report', async ({ page }) => {
+  const report = { ...reviewReport, findings: Array.from({ length: 8 }, (_, index) => ({
+    ...reviewReport.findings[0], title: 'Visible finding ' + index, explanation: 'A concrete explanation. '.repeat(40),
+    classification: index % 2 ? 'potential' : 'confirmed',
+  })) };
+  await dispatch(page, { type: 'reviewResult', id: 'long-report', text: 'Formatted export is deliberately ignored.', report });
+  const card = page.locator('.review-report');
+  await expect(card.locator('.review-finding')).toHaveCount(8);
+  await expect(card.locator('details')).toHaveCount(0);
+  for (let index = 0; index < 8; index++) await expect(card.getByRole('heading', { name: 'High: Visible finding ' + index, exact: true })).toBeVisible();
+  await expect(card).not.toContainText('Formatted export is deliberately ignored.');
+  await card.getByRole('button', { name: 'Open src/old.ts:1 (base)', exact: true }).nth(4).click();
+  expect(await page.evaluate(() => window.__messages.at(-1))).toMatchObject({ type: 'openReviewReference', reportId: 'long-report', findingIndex: 1 });
+});
+
+test('empty structured report always shows the no-findings caveat and source limitations', async ({ page }) => {
+  const report = { ...reviewReport, findings: [], limitations: ['Only tracked changes were reviewed.'] };
+  await dispatch(page, { type: 'reviewResult', id: 'empty-report', text: '', report });
+  const card = page.locator('.review-report');
+  await expect(card).toContainText('This does not establish that the changes are defect-free.');
+  await expect(card).toContainText('Tests were not run.');
+  await expect(card).toContainText('Only tracked changes were reviewed.');
+  await expect(card.getByText('None reported.', { exact: true })).toHaveCount(2);
+  await expect(card.locator('.review-references button')).toHaveCount(0);
+});
+
 declare global {
   interface Window {
     __messages: Array<Record<string, unknown>>;

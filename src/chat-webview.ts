@@ -15,7 +15,7 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
   body { margin: 0; color: var(--vscode-foreground, #ccc); background: var(--vscode-sideBar-background, #181818); font: 13px/1.5 var(--vscode-font-family, system-ui); }
-  button, select, textarea { font: inherit; color: inherit; }
+  button, select, textarea, input { font: inherit; color: inherit; }
   button { cursor: pointer; border: 1px solid transparent; border-radius: 5px; background: transparent; padding: 5px 9px; }
   button:hover { background: var(--vscode-toolbar-hoverBackground, #ffffff14); }
   button:disabled { opacity: .45; cursor: default; }
@@ -69,6 +69,22 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   footer { padding: 0 10px 10px; min-width: 0; }
   .status { min-height: 30px; display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--vscode-descriptionForeground, #999); padding: 6px 2px; }
   .status-dot { height: 6px; width: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  #status { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #workflow { max-width: 110px; font-size: 11px; }
+  .review-options { display: grid; gap: 7px; margin-bottom: 8px; font-size: 11px; }
+  .review-source-row { display: flex; align-items: center; gap: 8px; }
+  .review-source-row select { flex: 1; }
+  .review-commits { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+  .review-commits label { display: grid; gap: 3px; min-width: 0; }
+  .review-commits input { min-width: 0; width: 100%; padding: 5px; border: 1px solid var(--vscode-input-border, #ffffff30); border-radius: 4px; background: var(--vscode-input-background, #242424); }
+  .review-references { display: grid; gap: 5px; margin-top: 9px; }
+  .review-references button { text-align: left; overflow-wrap: anywhere; min-width: 0; font-size: 11px; }
+  .review-report .message-actions { flex-wrap: wrap; }
+  .review-report h2 { font-size: 14px; margin: 16px 0 7px; }
+  .review-report h3 { font-size: 12px; margin: 0 0 7px; }
+  .review-finding { border-left: 2px solid var(--vscode-panel-border, #ffffff30); margin: 10px 0; padding-left: 9px; }
+  .review-finding p, .review-summary { white-space: pre-wrap; }
+  .review-report ul { padding-left: 20px; }
   .shell[data-busy="true"] .status-dot { background: var(--vscode-progressBar-background, #0078d4); animation: pulse 1.2s infinite alternate; }
   @keyframes pulse { to { opacity: .35; } }
   @media (prefers-reduced-motion: reduce) { .status-dot { animation: none !important; } }
@@ -120,13 +136,17 @@ export function renderChatHtml(webview: { cspSource: string }): string {
     </section>
   </main>
   <footer>
-    <div class="status" role="status" aria-live="polite"><span class="status-dot"></span><span id="status">Ready</span></div>
+    <div class="status"><span class="status-dot"></span><span id="status" role="status" aria-live="polite">Ready</span><select id="workflow" aria-label="Workflow"><option value="normal">Build / Ask</option><option value="review">Review</option></select></div>
     <section id="review" aria-label="Action approval" hidden>
       <div class="eyebrow">Your approval is needed</div>
       <div id="reviewTitle"></div>
       <div class="review-actions"><button id="preview" class="secondary">Preview diff</button><button id="approve" class="primary">Approve</button><button id="reject" class="secondary">Reject</button></div>
     </section>
     <div class="composer">
+      <div id="reviewOptions" class="review-options" hidden>
+        <div class="review-source-row"><label for="reviewSource">Changes</label><select id="reviewSource"><option value="unstaged">Unstaged changes</option><option value="staged">Staged changes</option><option value="commits">Commit range</option></select></div>
+        <div id="reviewCommits" class="review-commits" hidden><label for="reviewBase">Base ref<input id="reviewBase" value="HEAD~1" spellcheck="false"></label><label for="reviewTarget">Target ref<input id="reviewTarget" value="HEAD" spellcheck="false"></label></div>
+      </div>
       <textarea id="prompt" aria-label="Task" placeholder="Ask the agent to build, fix, or explore…" rows="3"></textarea>
       <div class="composer-toolbar">
         <select id="permissionMode" aria-label="Agent mode" title="Agent mode"><option value="every">Approve every action</option><option value="safe">Safe auto</option><option value="full">Full access</option><option value="ask">Ask only</option></select>
@@ -164,6 +184,7 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   const copies = new Map();
   let copyRequestId = 0;
   let busy = false, activeSessionId, canSelectWorkspace = false;
+  let workflow = 'normal', workflowPending = false, activeReview = false;
   let currentAssistant, currentReasoning, assistantText = '', reasoningText = '', approvalId, failed = false;
   let selectedModel = saved.model || '', selectedBackend = saved.backend, approvalMode = saved.approvalMode || 'safe';
   let scheduledRender;
@@ -171,7 +192,7 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   function remember() { vscode.setState({ drafts: Object.fromEntries(drafts), model: model.value, backend: selectedBackend, approvalMode }); }
   function nearBottom() { return messages.scrollHeight - messages.scrollTop - messages.clientHeight < 90; }
   function follow(wasNear) { if (wasNear) messages.scrollTop = messages.scrollHeight; }
-  function syncSend() { send.disabled = busy || !model.value || !prompt.value.trim(); }
+  function syncSend() { send.disabled = busy || workflowPending || !model.value || (workflow !== 'review' && !prompt.value.trim()); }
   function resizePrompt() { prompt.style.height = 'auto'; prompt.style.height = Math.min(prompt.scrollHeight, 160) + 'px'; syncSend(); }
   function setBusy(value) {
     busy = value;
@@ -182,14 +203,26 @@ export function renderChatHtml(webview: { cspSource: string }): string {
     updateComposerState();
   }
   function updateComposerState() {
+    const reviewing = workflow === 'review';
+    byId('workflow').value = workflow; byId('workflow').disabled = busy || workflowPending;
+    byId('reviewOptions').hidden = !reviewing;
+    byId('reviewCommits').hidden = byId('reviewSource').value !== 'commits';
+    byId('permissionMode').hidden = reviewing; byId('permissionMode').disabled = busy || reviewing || workflowPending;
+    for (const id of ['reviewSource', 'reviewBase', 'reviewTarget']) byId(id).disabled = busy || workflowPending;
+    send.setAttribute('aria-label', reviewing ? 'Review changes' : 'Send task'); send.title = reviewing ? 'Review changes' : 'Send task';
+    prompt.setAttribute('aria-label', reviewing ? 'Review focus (optional)' : 'Task');
     const permissionHints = { every: 'Approve every action', safe: 'Safe operations run automatically', full: 'Full access · operations run automatically', ask: 'Ask only · no operations' };
     if (busy) {
-      byId('modeHint').textContent = 'Working · Draft a follow-up below · Shift+Enter for newline';
+      byId('modeHint').textContent = (activeReview ? 'Reviewing changes' : 'Working') + ' · Draft a follow-up below · Shift+Enter for newline';
       prompt.placeholder = 'Draft a follow-up while the task runs…';
+    } else if (reviewing) {
+      byId('modeHint').textContent = 'Read-only review · Tests are not run · Shift+Enter for newline';
+      prompt.placeholder = 'Optional: focus the review on a concern…';
     } else {
       byId('modeHint').textContent = permissionHints[approvalMode] + ' · Shift+Enter for newline';
       prompt.placeholder = approvalMode === 'ask' ? 'Ask about your project…' : 'Ask the agent to build, fix, or explore…';
     }
+    syncSend();
   }
   function toggleSheet(id, open) {
     for (const [panel, trigger] of [['historyPanel', 'historyButton'], ['settingsPanel', 'settingsButton']]) {
@@ -224,29 +257,32 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       }
     });
   }
-  function addCopy(body) {
+  function addCopy(body, reportId) {
     const controls = document.createElement('div'); controls.className = 'message-actions';
     const button = document.createElement('button'); button.type = 'button'; button.className = 'icon'; button.title = 'Copy';
-    button.setAttribute('aria-label', 'Copy assistant message');
+    const copyTitle = reportId ? 'Copy PR summary' : 'Copy';
+    button.title = copyTitle;
+    button.setAttribute('aria-label', reportId ? 'Copy PR summary' : 'Copy assistant message');
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 16 16'); svg.setAttribute('aria-hidden', 'true');
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     const copyPath = 'M5 5h8v9H5zM3 11H1V1h8v2';
     path.setAttribute('d', copyPath); svg.append(path); button.append(svg);
+    if (reportId) { button.className = 'secondary'; button.append(document.createTextNode(' Copy PR summary')); }
     const feedback = document.createElement('span'); feedback.className = 'muted'; feedback.setAttribute('role', 'status');
     let feedbackTimer;
     button.addEventListener('click', () => {
       clearTimeout(feedbackTimer); feedback.textContent = ''; button.disabled = true;
-      path.setAttribute('d', copyPath); button.title = 'Copy';
+      path.setAttribute('d', copyPath); button.title = copyTitle;
       const requestId = String(++copyRequestId);
       copies.set(requestId, success => {
         button.disabled = false; feedback.textContent = success ? 'Copied' : 'Copy failed. Try again.';
-        path.setAttribute('d', success ? 'M3 8l3 3 7-7' : copyPath); button.title = success ? 'Copied' : 'Copy';
-        feedbackTimer = setTimeout(() => { feedback.textContent = ''; path.setAttribute('d', copyPath); button.title = 'Copy'; }, 2000);
+        path.setAttribute('d', success ? 'M3 8l3 3 7-7' : copyPath); button.title = success ? 'Copied' : copyTitle;
+        feedbackTimer = setTimeout(() => { feedback.textContent = ''; path.setAttribute('d', copyPath); button.title = copyTitle; }, 2000);
       });
       // Include folded content, excluding the role, code summaries and controls.
       const text = [...body.querySelectorAll('.prose, pre')].map(node => node.textContent).join('');
-      vscode.postMessage({ type: 'copy', requestId, text });
+      vscode.postMessage(reportId ? { type: 'copyReview', requestId, reportId } : { type: 'copy', requestId, text });
     });
     controls.append(button, feedback); body.parentElement.append(controls);
   }
@@ -256,6 +292,42 @@ export function renderChatHtml(webview: { cspSource: string }): string {
     const label = document.createElement('div'); label.className = 'role'; label.textContent = role;
     const body = document.createElement('div'); renderBody(body, text);
     item.append(label, body); messages.append(item); follow(followTail); return body;
+  }
+  function addReview(id, report) {
+    const tail = nearBottom();
+    const body = addMessage('Code review', '', 'assistant review-report');
+    const label = document.createElement('p'); label.className = 'muted'; label.textContent = report.label;
+    const summary = document.createElement('p'); summary.className = 'review-summary'; summary.textContent = report.summary;
+    body.append(label, summary);
+    for (const classification of ['confirmed', 'potential']) {
+      const group = document.createElement('section'); group.className = 'review-group';
+      const heading = document.createElement('h2'); heading.textContent = classification === 'confirmed' ? 'Confirmed findings' : 'Potential risks';
+      group.append(heading);
+      for (const [index, finding] of report.findings.entries()) {
+        if (finding.classification !== classification) continue;
+        const card = document.createElement('section'); card.className = 'review-finding';
+        const title = document.createElement('h3'); title.textContent = finding.severity + ': ' + finding.title;
+        const explanation = document.createElement('p'); explanation.textContent = finding.explanation;
+        const evidenceLabel = document.createElement('p'); evidenceLabel.className = 'muted'; evidenceLabel.textContent = 'Evidence';
+        const evidence = document.createElement('pre'); evidence.textContent = finding.evidence;
+        const references = document.createElement('div'); references.className = 'review-references';
+        references.setAttribute('aria-label', 'Review source references');
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary';
+        button.textContent = 'Open ' + finding.path + ':' + finding.startLine + (finding.endLine !== finding.startLine ? '-' + finding.endLine : '') + ' (' + finding.side + ')';
+        button.addEventListener('click', () => vscode.postMessage({ type: 'openReviewReference', reportId: id, findingIndex: index }));
+        references.append(button); card.append(title, explanation, evidenceLabel, evidence, references); group.append(card);
+      }
+      if (group.children.length === 1) { const empty = document.createElement('p'); empty.textContent = 'None reported.'; group.append(empty); }
+      body.append(group);
+    }
+    if (!report.findings.length) {
+      const caveat = document.createElement('p'); caveat.textContent = 'No actionable findings were identified in the reviewed changes. This does not establish that the changes are defect-free.'; body.append(caveat);
+    }
+    const limitsHeading = document.createElement('h2'); limitsHeading.textContent = 'Limitations';
+    const tests = document.createElement('p'); tests.textContent = 'Tests were not run. This was a read-only review.';
+    const limits = document.createElement('ul');
+    for (const limitation of report.limitations) { const item = document.createElement('li'); item.textContent = limitation; limits.append(item); }
+    body.append(limitsHeading, tests, limits); addCopy(body, id); follow(tail);
   }
   function addTool(text, activity) {
     const followTail = nearBottom(); welcome.hidden = true;
@@ -314,6 +386,9 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   }
   window.addEventListener('message', event => {
     const msg = event.data;
+    if (msg.type === 'workflow' && (msg.workflow === 'normal' || msg.workflow === 'review')) {
+      workflow = msg.workflow; workflowPending = false; updateComposerState();
+    }
     if (msg.type === 'summaryDelta') addSummary(msg.id, msg.text);
     if (msg.type === 'workspace') {
       byId('workspaceLabel').textContent = 'Workspace: ' + msg.label;
@@ -356,7 +431,8 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       currentReasoning = undefined; reasoningText = ''; currentAssistant = undefined; assistantText = '';
       messages.replaceChildren(welcome); welcome.hidden = msg.items.length > 0; actions.clear(); summaries.clear();
       for (const item of msg.items) {
-        if (item.role === 'Tool') addTool(item.text, item.activity);
+        if (item.reviewReport) addReview(item.id, item.reviewReport);
+        else if (item.role === 'Tool') addTool(item.text, item.activity);
         else if (item.role === 'Summary') addSummary(item.id || 'restored-' + summaries.size, item.text, false);
         else if (item.role === 'Reasoning') { currentReasoning = undefined; addReasoning(item.text); currentReasoning = undefined; }
         else {
@@ -385,8 +461,8 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       status.textContent = msg.approved ? 'Applying approved action…' : 'Action declined';
     }
     if (msg.type === 'assistantStart') {
-      failed = false; assistantText = ''; reasoningText = ''; currentReasoning = undefined;
-      currentAssistant = msg.agent ? undefined : addMessage('Agent', ''); setBusy(true); status.textContent = 'Thinking…';
+      failed = false; assistantText = ''; reasoningText = ''; currentReasoning = undefined; activeReview = msg.review === true;
+      currentAssistant = msg.agent ? undefined : addMessage('Agent', ''); setBusy(true); status.textContent = activeReview ? 'Reviewing changes…' : 'Thinking…';
     }
     if (msg.type === 'assistantDelta' && currentAssistant) {
       if (!assistantText) messages.append(currentAssistant.parentElement);
@@ -407,6 +483,11 @@ export function renderChatHtml(webview: { cspSource: string }): string {
         if (reasoningText) addReasoning(reasoningText);
       });
     }
+    if (msg.type === 'reviewResult') {
+      if (scheduledRender) cancelAnimationFrame(scheduledRender); scheduledRender = undefined;
+      currentReasoning?.remove(); currentReasoning = undefined; reasoningText = '';
+      addReview(msg.id, msg.report);
+    }
     if (msg.type === 'assistantFinal') {
       if (scheduledRender) cancelAnimationFrame(scheduledRender); scheduledRender = undefined;
       currentReasoning?.remove(); currentReasoning = undefined; reasoningText = '';
@@ -424,7 +505,9 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       if (currentAssistant && !assistantText.trim()) currentAssistant.parentElement.remove();
       if (currentAssistant && assistantText.trim() && !failed && (!msg.outcome || msg.outcome === 'success')) addCopy(currentAssistant);
       setBusy(false); currentAssistant = undefined; currentReasoning = undefined;
-      status.textContent = msg.outcome === 'cancelled' ? 'Stopped · Applied changes kept' : failed || msg.outcome === 'error' ? 'Needs attention' : msg.outcome === 'success' ? 'Task completed' : 'Ready';
+      const reviewed = activeReview || msg.review === true;
+      status.textContent = msg.outcome === 'cancelled' ? (reviewed ? 'Review stopped' : 'Stopped · Applied changes kept') : failed || msg.outcome === 'error' ? 'Needs attention' : msg.outcome === 'success' ? (reviewed ? 'Review completed' : 'Task completed') : 'Ready';
+      activeReview = false;
       remember(); resizePrompt();
     }
     if (msg.type === 'error') { failed = true; addMessage('Needs attention', msg.message, 'error'); status.textContent = 'Needs attention'; }
@@ -434,12 +517,18 @@ export function renderChatHtml(webview: { cspSource: string }): string {
     }
   });
   send.addEventListener('click', () => {
-    const text = prompt.value.trim(); if (busy || !text || !model.value) return;
+    const text = prompt.value.trim(); if (busy || workflowPending || (workflow !== 'review' && !text) || !model.value) return;
+    activeReview = workflow === 'review';
     failed = false; setBusy(true); status.textContent = 'Starting…'; toggleSheet('', false);
-    addMessage('You', text);
+    addMessage('You', text || 'Review ' + byId('reviewSource').selectedOptions[0].textContent.toLowerCase());
     // The conversation owns submitted text. Keep the composer available for a follow-up.
     prompt.value = ''; drafts.delete(activeSessionId); resizePrompt(); remember(); prompt.focus();
-    vscode.postMessage({ type: 'send', text, model: model.value, useAgent: approvalMode !== 'ask' });
+    if (workflow === 'review') {
+      const source = byId('reviewSource').value;
+      const review = { source };
+      if (source === 'commits') { review.base = byId('reviewBase').value.trim(); review.target = byId('reviewTarget').value.trim(); }
+      vscode.postMessage({ type: 'send', text, model: model.value, review });
+    } else vscode.postMessage({ type: 'send', text, model: model.value, useAgent: approvalMode !== 'ask' });
   });
   stop.addEventListener('click', () => { stop.disabled = true; status.textContent = 'Stopping…'; vscode.postMessage({ type: 'stop' }); });
   prompt.addEventListener('input', () => { if (activeSessionId) drafts.set(activeSessionId, prompt.value); remember(); resizePrompt(); });
@@ -451,6 +540,14 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   byId('apiMode').addEventListener('change', () => vscode.postMessage({ type: 'setApiMode', apiMode: byId('apiMode').value }));
   byId('reasoningSummary').addEventListener('change', () => vscode.postMessage({ type: 'setSummary', summary: byId('reasoningSummary').value }));
   byId('permissionMode').addEventListener('change', () => { approvalMode = byId('permissionMode').value; updateComposerState(); remember(); vscode.postMessage({ type: 'setApprovalMode', approvalMode }); });
+  byId('workflow').addEventListener('change', () => {
+    if (busy || workflowPending) { updateComposerState(); return; }
+    const requested = byId('workflow').value;
+    if (requested === workflow) return;
+    workflowPending = true; updateComposerState();
+    vscode.postMessage({ type: 'setWorkflow', workflow: requested });
+  });
+  byId('reviewSource').addEventListener('change', updateComposerState);
   for (const [id, panel] of [['historyButton', 'historyPanel'], ['settingsButton', 'settingsPanel']]) byId(id).addEventListener('click', () => toggleSheet(panel, byId(panel).hidden));
   for (const button of document.querySelectorAll('[data-close]')) button.addEventListener('click', () => { const id = button.dataset.close; toggleSheet('', false); byId(id === 'historyPanel' ? 'historyButton' : 'settingsButton').focus(); });
   document.addEventListener('keydown', event => { if (event.key === 'Escape') { toggleSheet('', false); prompt.focus(); } });
