@@ -260,15 +260,14 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   function addCopy(body, reportId) {
     const controls = document.createElement('div'); controls.className = 'message-actions';
     const button = document.createElement('button'); button.type = 'button'; button.className = 'icon'; button.title = 'Copy';
-    const copyTitle = reportId ? 'Copy PR summary' : 'Copy';
+    const copyTitle = 'Copy';
     button.title = copyTitle;
-    button.setAttribute('aria-label', reportId ? 'Copy PR summary' : 'Copy assistant message');
+    button.setAttribute('aria-label', reportId ? 'Copy review report' : 'Copy assistant message');
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 16 16'); svg.setAttribute('aria-hidden', 'true');
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     const copyPath = 'M5 5h8v9H5zM3 11H1V1h8v2';
     path.setAttribute('d', copyPath); svg.append(path); button.append(svg);
-    if (reportId) { button.className = 'secondary'; button.append(document.createTextNode(' Copy PR summary')); }
     const feedback = document.createElement('span'); feedback.className = 'muted'; feedback.setAttribute('role', 'status');
     let feedbackTimer;
     button.addEventListener('click', () => {

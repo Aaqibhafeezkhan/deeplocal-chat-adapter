@@ -171,7 +171,7 @@ Starting or switching tasks keeps Review active until you explicitly leave it.
 Reports separate confirmed findings from potential risks and include severity
 (Critical, High, Medium, or Low), explanation, and verbatim source evidence.
 Source buttons open a read-only copy of the reviewed content, including deleted
-or historical lines. **Copy PR summary** copies the report as Markdown for you
+or historical lines. The copy icon below the report copies it as Markdown for you
 to paste into a pull request; it does not connect to or post on GitHub. Completed
 reports are retained in the existing workspace session history.
 

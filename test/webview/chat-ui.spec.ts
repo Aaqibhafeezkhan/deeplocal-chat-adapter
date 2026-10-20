@@ -107,19 +107,33 @@ test('dedicated review reports open host references and copy PR summaries with f
   await expect(page.getByRole('button', { name: 'Copy assistant message', exact: true })).toHaveCount(0);
   await card.getByRole('button', { name: 'Open src/old.ts:1 (base)', exact: true }).click();
   expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'openReviewReference', reportId: 'report-1', findingIndex: 0 });
-  const copy = card.getByRole('button', { name: 'Copy PR summary', exact: true });
+  const copy = card.getByRole('button', { name: 'Copy review report', exact: true });
+  await expect(copy).toHaveClass('icon');
+  await expect(copy).toHaveText('');
+  await expect(copy).toHaveAttribute('title', 'Copy');
+  await expect(copy.locator('svg')).toHaveAttribute('aria-hidden', 'true');
+  const copyPath = 'M5 5h8v9H5zM3 11H1V1h8v2';
+  await expect(copy.locator('path')).toHaveAttribute('d', copyPath);
   await copy.focus(); await page.keyboard.press('Enter');
   const request = await page.evaluate(() => window.__messages.at(-1));
   expect(request).toEqual({ type: 'copyReview', reportId: 'report-1', requestId: expect.any(String) });
   await expect(copy).toBeDisabled();
   await dispatch(page, { type: 'copyResult', requestId: request!.requestId, success: false });
   await expect(card.locator('.message-actions [role="status"]')).toHaveText('Copy failed. Try again.');
+  await expect(copy).toHaveAttribute('title', 'Copy');
+  await expect(copy.locator('path')).toHaveAttribute('d', copyPath);
   await copy.click();
   const retry = await page.evaluate(() => window.__messages.at(-1));
   expect(retry!.requestId).not.toBe(request!.requestId);
   await dispatch(page, { type: 'copyResult', requestId: retry!.requestId, success: true });
   await expect(card.locator('.message-actions [role="status"]')).toHaveText('Copied');
   await expect(copy).toBeEnabled();
+  await expect(copy).toHaveAttribute('title', 'Copied');
+  await expect(copy.locator('path')).toHaveAttribute('d', 'M3 8l3 3 7-7');
+  await expect(copy).toHaveText('');
+  await expect(card.locator('.message-actions [role="status"]')).toBeEmpty();
+  await expect(copy.locator('path')).toHaveAttribute('d', copyPath);
+  await expect(copy).toHaveAttribute('title', 'Copy');
 });
 
 test('restored review reports retain safe references without executing HTML or creating model links', async ({ page }) => {
@@ -135,7 +149,7 @@ test('restored review reports retain safe references without executing HTML or c
   expect(await page.evaluate(() => 'compromised' in window)).toBe(false);
   await card.locator('.review-references button').click();
   expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'openReviewReference', reportId: 'saved-review', findingIndex: 0 });
-  await card.getByRole('button', { name: 'Copy PR summary', exact: true }).click();
+  await card.getByRole('button', { name: 'Copy review report', exact: true }).click();
   expect(await page.evaluate(() => window.__messages.at(-1))).toMatchObject({ type: 'copyReview', reportId: 'saved-review' });
 });
 
