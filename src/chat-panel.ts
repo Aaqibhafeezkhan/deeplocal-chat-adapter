@@ -5,7 +5,7 @@ import { DeepLocalClient } from './deeplocal-client';
 import { Logger } from './logger';
 import { ChatMessage, ToolCall, ResponseContext, StreamEvent } from './protocol';
 import { renderChatHtml } from './chat-webview';
-import { toolActivity, ToolActivity } from './tool-activity';
+import { toolActivity, ToolActivity, redactToolActivityDetail } from './tool-activity';
 import { requireWorkspaceFolder, sameWorkspace, workspaceLabel } from './agent-workspace';
 import { createGitReview } from './review-git';
 import { runReview } from './review-runner';
@@ -719,7 +719,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private restoreTranscript(): void {
     const session = repairTranscript(this.activeSession());
     this.postWorkflow();
-    this.post({ type: 'restore', items: session.transcript });
+    const items = session.transcript.map(item => item.activity
+      ? { ...item, activity: { ...item.activity, detail: redactToolActivityDetail(item.activity.detail) } }
+      : item);
+    this.post({ type: 'restore', items });
   }
 
 

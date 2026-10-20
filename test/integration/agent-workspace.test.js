@@ -5,6 +5,13 @@ const path = require('node:path');
 const vscode = require('vscode');
 const { buildSync } = require('esbuild');
 
+async function assertSameDirectory(actual, expected) {
+  assert.equal(
+    await fs.realpath(actual),
+    await fs.realpath(expected),
+  );
+}
+
 // Exercise the actual source against VS Code's real filesystem, edits and URIs.
 buildSync({ entryPoints: [path.join(__dirname, '../../src/agent-tools.ts')], bundle: true,
   platform: 'node', format: 'cjs', external: ['vscode'], outfile: path.join(__dirname, '../../out/workspace-tools.cjs') });
@@ -77,7 +84,7 @@ suite('Agent workspace selection with real files', () => {
       const args = process.platform === 'win32' ? ['/d', '/c', 'cd'] : [];
       const result = await call('run_command', { command, args }, folder, options);
       assert.equal(result.status, 'success', result.content);
-      assert.equal(result.content.trim(), folder.uri.fsPath);
+      await assertSameDirectory(result.content.trim(), folder.uri.fsPath);
       assert.equal(await fs.readFile(path.join(folder.uri.fsPath, 'new.txt'), 'utf8'), `replaced-${index}`);
     }
     assert.equal(await fs.readFile(path.join(roots[0].fsPath, 'same.txt'), 'utf8'), 'changed-0');
@@ -90,7 +97,7 @@ suite('Agent workspace selection with real files', () => {
     } };
     const result = await invokeAgentTool('test', 'run_command', JSON.stringify({ command: process.platform === 'win32' ? 'cmd.exe' : 'pwd',
       args: process.platform === 'win32' ? ['/d', '/c', 'cd'] : [] }), options);
-    assert.equal(result.content.trim(), folders[1].uri.fsPath);
+    await assertSameDirectory(result.content.trim(), folders[1].uri.fsPath);
   });
 
   test('scopes listings, search, summaries and diagnostics to the selected root', async () => {
