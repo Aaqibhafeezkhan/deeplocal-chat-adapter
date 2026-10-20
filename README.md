@@ -27,6 +27,7 @@ To quickly test the extension during development:
 - Run coding tasks with workspace-aware tools for reading, searching, editing,
   creating, opening, and trashing individual files, as well as running commands.
 - Review file changes before approval, with a diff preview where available.
+- Review staged, unstaged, or committed Git changes in a dedicated read-only mode.
 - Choose an approval mode: approve every operation, automatically allow safe
   operations, allow all operations, or use discussion-only mode.
 - View streamed progress updates, tool activity, and final answers separately.
@@ -150,6 +151,44 @@ The Open command reveals the sidebar at its saved VS Code location. To put it
 on the right, right-click the DeepLocal view title and select **Move View →
 Secondary Side Bar**. If necessary, first run **View: Toggle Secondary Side Bar
 Visibility** from the Command Palette.
+
+## Review code changes
+
+Choose **Review** in the sidebar, select a model with tool calling, and choose
+**Unstaged**, **Staged**, or **Commit range**. A written prompt is optional;
+use it to focus the review on a particular concern. For a commit range, enter
+base and target refs (hashes, branches, or tags). The defaults are `HEAD~1` and
+`HEAD`; the review compares those two commits directly, without computing a
+merge base.
+
+Review mode inspects changes, surrounding source, and relevant tests. It cannot
+edit files, run commands, or execute tests, even when **Full access** is selected.
+It uses its own review context rather than replaying normal agent instructions.
+Switching back to **Build / Ask** requires confirmation; fixes must be requested as a
+new normal-mode task and follow the selected approval setting.
+Starting or switching tasks keeps Review active until you explicitly leave it.
+
+Reports separate confirmed findings from potential risks and include severity
+(Critical, High, Medium, or Low), explanation, and verbatim source evidence.
+Source buttons open a read-only copy of the reviewed content, including deleted
+or historical lines. The copy icon below the report copies it as Markdown for you
+to paste into a pull request; it does not connect to or post on GitHub. Completed
+reports are retained in the existing workspace session history.
+
+Git must be available, and the selected local workspace folder must be inside a
+complete Git repository. Partial/promisor clones are rejected because reading
+missing objects can trigger a fetch. Repository-configured executable Git helpers
+are disabled during review; any disabled content filters are reported as a
+limitation. Reviews cover tracked, saved files only: untracked files and
+unsaved editor buffers are excluded. Staged reviews inspect index content;
+commit reviews inspect the selected revisions. An unstaged review is rejected
+if its underlying changes or inspected saved files change before completion.
+Binary and submodule contents are reported as limitations. Diffs and individual
+source files are limited to 60,000 characters; oversized diffs require a narrower
+comparison. Search is bounded and reports skipped or truncated evidence.
+
+Empty diffs do not make a model request. Empty findings do not guarantee that
+the changes are correct. Every report states that tests were not run.
 
 ## Configure a backend
 

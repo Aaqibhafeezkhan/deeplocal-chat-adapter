@@ -7,9 +7,13 @@ import { ChatMessage, ToolCall, ResponseContext, StreamEvent } from './protocol'
 import { renderChatHtml } from './chat-webview';
 import { toolActivity, ToolActivity, redactToolActivityDetail } from './tool-activity';
 import { requireWorkspaceFolder, sameWorkspace, workspaceLabel } from './agent-workspace';
+import { createGitReview } from './review-git';
+import { runReview } from './review-runner';
+import { formatReviewReport } from './review-report';
+import { ReviewRequest, ReviewReport } from './review-types';
 
 interface WebviewMessage {
-  type: 'selectWorkspace' | 'ready' | 'send' | 'stop' | 'approval' | 'preview' | 'refreshModels' | 'newSession' | 'switchSession' | 'deleteSession' | 'setBackend' | 'setRemoteApiKey' | 'clearRemoteApiKey' | 'setApiMode' | 'setSummary' | 'setApprovalMode' | 'copy';
+  type: 'selectWorkspace' | 'ready' | 'send' | 'stop' | 'approval' | 'preview' | 'refreshModels' | 'newSession' | 'switchSession' | 'deleteSession' | 'setBackend' | 'setRemoteApiKey' | 'clearRemoteApiKey' | 'setApiMode' | 'setSummary' | 'setApprovalMode' | 'copy' | 'setWorkflow' | 'openReviewReference' | 'copyReview';
   requestId?: string;
   apiMode?: 'chat-completions' | 'responses';
   summary?: 'off' | 'auto';
@@ -20,6 +24,10 @@ interface WebviewMessage {
   model?: string;
   sessionId?: string;
   useAgent?: boolean;
+  workflow?: 'normal' | 'review';
+  review?: ReviewRequest;
+  reportId?: string;
+  findingIndex?: number;
 }
 
 interface PersistedChatItem {
@@ -27,6 +35,7 @@ interface PersistedChatItem {
   id?: string;
   text: string;
   activity?: ToolActivity;
+  reviewReport?: ReviewReport;
 }
 
 interface ChatSession {
@@ -35,6 +44,7 @@ interface ChatSession {
   updatedAt: number;
   history: ChatMessage[];
   transcript: PersistedChatItem[];
+  workflow?: 'normal' | 'review';
 }
 
 export class ChatPanel implements vscode.WebviewViewProvider {
@@ -47,6 +57,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private selectedWorkspace: vscode.WorkspaceFolder | undefined;
   private taskWorkspace: vscode.WorkspaceFolder | undefined;
   private choosingWorkspace = false;
+  private choosingWorkflow = false;
   private sessions: ChatSession[] = [];
   private activeSessionId: string;
   private activeRequestId: string | undefined;
@@ -54,6 +65,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private pendingApproval: { id: string; resolve: (approved: boolean) => void; preview?: () => Promise<void> } | undefined;
   private persistTimer: ReturnType<typeof setTimeout> | undefined;
   private view: vscode.WebviewView | undefined;
+  private readonly reviewDocuments = new Map<string, string>();
   private readonly scopedSessionsKey = `${ChatPanel.sessionsKey}.${workspaceIdentity()}`;
   private readonly scopedActiveSessionKey = `${ChatPanel.activeSessionKey}.${workspaceIdentity()}`;
 
@@ -77,6 +89,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       }
       this.postWorkspace();
     }));
+    this.context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('deeplocal-review', {
+      provideTextDocumentContent: uri => this.reviewDocuments.get(uri.toString()) ?? '',
+    }));
+    this.context.subscriptions.push({ dispose: () => this.reviewDocuments.clear() });
     this.sessions = this.loadSessions().map(repairTranscript);
     this.activeSessionId = this.context.workspaceState.get<string>(this.scopedActiveSessionKey, this.sessions[0].id);
     if (!this.sessions.some((session) => session.id === this.activeSessionId)) {
@@ -116,7 +132,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   async newSession(): Promise<void> {
     if (this.activeRequestId) return;
 
+    const workflow = this.activeSession().workflow;
     const session = createSession();
+    session.workflow = workflow;
     this.sessions.unshift(session);
     this.activeSessionId = session.id;
     await this.persist();
@@ -151,6 +169,21 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       return;
     }
     if (message.type === 'stop') { this.stopTask(); return; }
+    if (message.type === 'openReviewReference') {
+      await this.openReviewReference(message.reportId, message.findingIndex);
+      return;
+    }
+    if (message.type === 'copyReview') {
+      const report = this.activeSession().transcript.find(item => item.id === message.reportId)?.reviewReport;
+      if (!report || typeof message.requestId !== 'string') return;
+      try {
+        await vscode.env.clipboard.writeText(formatReviewReport(report));
+        this.post({ type: 'copyResult', requestId: message.requestId, success: true });
+      } catch {
+        this.post({ type: 'copyResult', requestId: message.requestId, success: false });
+      }
+      return;
+    }
     if (message.type === 'approval' || message.type === 'preview') {
       const pending = this.pendingApproval;
       if (!pending || pending.id !== message.approvalId) return;
@@ -160,7 +193,30 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       return;
     }
     if (message.type === 'ready') this.postWorkspace();
-    if (this.activeRequestId) return;
+    if (this.activeRequestId || this.choosingWorkflow) return;
+    if (message.type === 'setWorkflow') {
+      if (message.workflow !== 'normal' && message.workflow !== 'review') return;
+      if (message.workflow === 'normal' && this.activeSession().workflow === 'review') {
+        this.choosingWorkflow = true;
+        try {
+          const choice = await vscode.window.showWarningMessage(
+            'Leave read-only Review mode? Normal mode can edit files and run commands according to your approval setting.',
+            { modal: true }, 'Enable normal mode',
+          );
+          if (choice !== 'Enable normal mode') return;
+          this.activeSession().workflow = 'normal';
+          await this.persist();
+        } finally {
+          this.choosingWorkflow = false;
+          this.postWorkflow();
+        }
+        return;
+      }
+      this.activeSession().workflow = message.workflow;
+      await this.persist();
+      this.postWorkflow();
+      return;
+    }
     if (message.type === 'selectWorkspace') { await this.selectWorkspace(); return; }
     if (message.type === 'setApiMode' && ['chat-completions', 'responses'].includes(message.apiMode ?? '')) {
       const key = getConfig().backend === 'remote' ? 'remote.apiMode' : 'apiMode';
@@ -221,7 +277,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     }
 
     if (message.type === 'switchSession' && message.sessionId) {
-      if (!this.sessions.some((session) => session.id === message.sessionId)) return;
+      const target = this.sessions.find(session => session.id === message.sessionId);
+      if (!target) return;
+      // Session navigation cannot silently re-enable the normal tool dispatcher.
+      if (this.activeSession().workflow === 'review') target.workflow = 'review';
       this.activeSessionId = message.sessionId;
       await this.persist();
       this.postSessions();
@@ -243,11 +302,17 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       return;
     }
 
-    const text = message.text?.trim();
+    const text = message.text?.trim() ?? '';
     const model = message.model?.trim();
-    if (!text || !model) {
+    if (!model) {
       return;
     }
+
+    if (this.activeSession().workflow === 'review') {
+      await this.sendReview(model, text, message.review);
+      return;
+    }
+    if (!text) return;
 
     await this.sendPrompt(model, text, message.useAgent !== false);
   }
@@ -267,6 +332,102 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       });
     } catch (error) {
       this.postError(`Failed to load ${getConfig().backend === 'remote' ? 'remote' : 'DeepLocal'} models: ${messageOf(error)}`);
+    }
+  }
+
+  private postWorkflow(): void {
+    this.post({ type: 'workflow', workflow: this.activeSession().workflow ?? 'normal' });
+  }
+
+  private async sendReview(model: string, focus: string, input?: ReviewRequest): Promise<void> {
+    let outcome: 'success' | 'error' | 'cancelled' = 'error';
+    const requestId = createId();
+    const controller = new AbortController();
+    const session = this.activeSession();
+    this.activeRequestId = requestId;
+    this.taskController = controller;
+    this.post({ type: 'assistantStart', agent: true, review: true });
+    try {
+      const request = input ?? { source: 'unstaged' };
+      if (!['unstaged', 'staged', 'commits'].includes(request.source)) throw new Error('Choose a valid review source.');
+      if (!this.client.modelInformation(model).toolCalling) throw new Error('Select a tool-capable model for Review mode.');
+      const folder = this.currentWorkspace();
+      if (!folder || this.choosingWorkspace) throw new Error('Open or choose a workspace folder before starting a review.');
+      if (folder.uri.scheme !== 'file') throw new Error('Git review requires a local filesystem workspace.');
+      this.taskWorkspace = folder;
+      this.postWorkspace();
+      const title = `Review ${request.source === 'commits' ? 'commit range' : request.source + ' changes'}`;
+      session.transcript.push({ role: 'You', text: focus || title });
+      if (session.transcript.length === 1) session.title = makeTitle(focus || title);
+      session.updatedAt = Date.now();
+      await this.persist();
+      this.postSessions();
+      this.post({ type: 'status', message: 'Collecting Git changes…' });
+      const source = await createGitReview(folder.uri.fsPath, request, controller.signal);
+      controller.signal.throwIfAborted();
+      requireWorkspaceFolder(folder);
+      if (!source.files.length) {
+        const text = [`No ${request.source === 'commits' ? 'commit-range' : request.source} changes to review. Untracked files and unsaved editor buffers are excluded. No model request was made; tests were not run.`, ...source.limitations].join('\n');
+        session.transcript.push({ role: 'DeepLocal', text });
+        this.post({ type: 'assistantFinal', text });
+      } else {
+        const report = await runReview({
+          requestId, model, source, focus, signal: controller.signal,
+          maxTurns: getConfig().agentMaxTurns,
+          maxOutputTokens: getConfig().maxOutputTokens,
+          stream: (id, request) => this.client.streamChat(id, request),
+          onProgress: text => { requireWorkspaceFolder(folder); this.post({ type: 'status', message: text }); },
+          onTool: (name, _content) => { this.post({ type: 'status', message: `Review · ${name}` }); },
+        });
+        controller.signal.throwIfAborted();
+        requireWorkspaceFolder(folder);
+        const id = createId();
+        const text = formatReviewReport(report);
+        session.transcript.push({ role: 'DeepLocal', id, text, reviewReport: report });
+        this.post({ type: 'reviewResult', id, text, report });
+      }
+      session.updatedAt = Date.now();
+      await this.persist();
+      this.postSessions();
+      outcome = 'success';
+    } catch (error) {
+      outcome = controller.signal.aborted ? 'cancelled' : 'error';
+      if (controller.signal.aborted) this.post({ type: 'notice', message: 'Review stopped. No file changes or commands were performed.' });
+      else this.postError(`Review failed: ${messageOf(error)}`);
+    } finally {
+      this.activeRequestId = undefined;
+      this.taskController = undefined;
+      this.taskWorkspace = undefined;
+      this.postWorkspace();
+      this.post({ type: 'assistantDone', outcome, review: true });
+    }
+  }
+
+  private async openReviewReference(reportId: string | undefined, findingIndex: number | undefined): Promise<void> {
+    if (!Number.isInteger(findingIndex) || findingIndex! < 0) return;
+    const report = this.activeSession().transcript.find(item => item.id === reportId)?.reviewReport;
+    const finding = report?.findings[findingIndex!];
+    if (!report || !finding) return;
+    const source = report.sources.find(item => item.path === finding.path && item.side === finding.side);
+    if (!source) return;
+    // A content provider opens the reviewed snapshot, never the mutable checkout.
+    const uri = vscode.Uri.parse(`deeplocal-review:/${finding.path.split('/').map(encodeURIComponent).join('/')}?side=${finding.side}&snapshot=${createId()}`);
+    const key = uri.toString();
+    this.reviewDocuments.set(key, source.content);
+    // Keep recent snapshots available without registering a provider for each navigation.
+    if (this.reviewDocuments.size > 128) {
+      const oldest = this.reviewDocuments.keys().next().value;
+      if (oldest !== undefined) this.reviewDocuments.delete(oldest);
+    }
+    try {
+      const document = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(document, {
+        preview: true,
+        selection: new vscode.Range(finding.startLine - 1, 0, finding.endLine - 1, 0),
+      });
+    } catch (error) {
+      this.reviewDocuments.delete(key);
+      throw error;
     }
   }
 
@@ -566,6 +727,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private restoreTranscript(): void {
     const session = repairTranscript(this.activeSession());
+    this.postWorkflow();
     const items = session.transcript.map(item => item.activity
       ? { ...item, activity: { ...item.activity, detail: redactToolActivityDetail(item.activity.detail) } }
       : item);
@@ -609,6 +771,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     if (!target) {
       return;
     }
+    const workflow = this.activeSession().workflow;
 
     const choice = await vscode.window.showWarningMessage(
       `Delete DeepLocal session "${target.title}"?`,
@@ -627,6 +790,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     if (this.activeSessionId === target.id) {
       this.activeSessionId = this.sessions[0].id;
     }
+    if (workflow === 'review') this.activeSession().workflow = 'review';
 
     await this.persist();
     this.postSessions();
