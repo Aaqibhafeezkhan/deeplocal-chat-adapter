@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { TextDecoder } from 'node:util';
 import type { ReviewEvidenceSource, ReviewFile, ReviewRequest, ReviewSide } from './review-types';
@@ -247,10 +247,21 @@ export class GitReviewSnapshot implements ReviewEvidenceSource {
     const realRoot = await fs.realpath(this.root);
     const real = await fs.realpath(absolute);
     if (!inside(realRoot, real)) throw new Error('Review source follows a symlink outside the selected workspace.');
-    const stat = await fs.stat(real);
-    if (!stat.isFile()) throw new Error('Review source is not a regular file.');
-    if (stat.size > TEXT_LIMIT * 4) throw new Error(`Review source file exceeds the ${TEXT_LIMIT} character limit.`);
-    return fs.readFile(real);
+    // Pin the resolved file with a descriptor so a final-component symlink
+    // replacement cannot redirect the read after the realpath check.
+    const handle = await fs.open(real, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error('Review source is not a regular file.');
+      if (stat.size > TEXT_LIMIT * 4) throw new Error(`Review source file exceeds the ${TEXT_LIMIT} character limit.`);
+      const bytes = await handle.readFile();
+      if (bytes.length > TEXT_LIMIT * 4) throw new Error(`Review source file exceeds the ${TEXT_LIMIT} character limit.`);
+      const current = await fs.stat(real);
+      if (current.dev !== stat.dev || current.ino !== stat.ino) throw new Error('Git review source changed. Start a new review.');
+      return bytes;
+    } finally {
+      await handle.close();
+    }
   }
 
   async readFile(value: string, side: ReviewSide = 'target'): Promise<string> {
