@@ -1,5 +1,6 @@
 import { test, expect, Page } from '@playwright/test';
 import { renderChatHtml } from '../../src/chat-webview';
+import { toolActivity } from '../../src/tool-activity';
 
 declare global {
   interface Window {
@@ -11,6 +12,40 @@ declare global {
 
 async function dispatch(page: Page, message: Record<string, unknown>) {
   await page.evaluate(message => window.dispatchEvent(new MessageEvent('message', { data: message })), message);
+}
+
+for (const [label, command] of [
+  ['authorization', "curl -H 'Authorization: Bearer syntheticCredential53'"],
+  ['attached filename', 'docker run --env-file=.env.production demo-image'],
+]) {
+  test(`renders redacted ${label} in live status, row tooltips and history while retaining ordinary targets`, async ({ page }, testInfo) => {
+    const sentinel = 'syntheticCredential53';
+    const activity = toolActivity('redacted-53', { id: 'call-53', type: 'function', function: {
+      name: 'run_command', arguments: JSON.stringify({ command, args: ['payload excluded'] }),
+    } });
+    await dispatch(page, { type: 'assistantStart', agent: true });
+    await dispatch(page, { type: 'status', message: `${activity.title} · ${activity.detail}` });
+    await dispatch(page, { type: 'toolStart', activity });
+    await expect(page.locator('#status')).toHaveText('Run command · [sensitive target redacted]');
+    await expect(page.locator('.action-path')).toHaveText('[sensitive target redacted]');
+    await expect(page.locator('.action-path')).toHaveAttribute('title', '[sensitive target redacted]');
+    await dispatch(page, { type: 'toolResult', text: 'run_command\nUser declined command execution.', activity: { ...activity, state: 'declined' } });
+    await expect(page.locator('.action-state')).toHaveText('Declined');
+    const ordinary = toolActivity('ordinary-53', { id: 'call-ordinary', type: 'function', function: {
+      name: 'search_workspace', arguments: '{"query":"basic usage"}',
+    } });
+    await dispatch(page, { type: 'toolStart', activity: ordinary });
+    await expect(page.locator('.action-path')).toHaveText(['[sensitive target redacted]', 'basic usage']);
+    expect(await page.locator('body').innerHTML()).not.toContain(sentinel);
+    expect(await page.locator('body').innerHTML()).not.toContain(command);
+    expect(await page.locator('body').innerHTML()).not.toContain('payload excluded');
+    await page.screenshot({ path: testInfo.outputPath('redacted-tool-activity.png') });
+    await dispatch(page, { type: 'restore', items: [{ role: 'Tool', text: 'run_command\nUser declined command execution.', activity: { ...activity, state: 'declined' } }] });
+    await expect(page.locator('.action-path')).toHaveText('[sensitive target redacted]');
+    await expect(page.locator('.action-path')).toHaveAttribute('title', '[sensitive target redacted]');
+    expect(await page.locator('body').innerHTML()).not.toContain(sentinel);
+    expect(await page.locator('body').innerHTML()).not.toContain(command);
+  });
 }
 
 test.beforeEach(async ({ page }) => {
