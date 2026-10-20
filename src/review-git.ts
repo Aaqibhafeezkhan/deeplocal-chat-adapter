@@ -180,10 +180,12 @@ export class GitReviewSnapshot implements ReviewEvidenceSource {
     if (partial) {
       throw new Error('Partial/promisor clones are not supported by read-only review; use a complete local clone.');
     }
-    this.repo = (await this.git(['rev-parse', '--show-toplevel'])).toString('utf8').trim();
-    this.prefix = path.relative(this.repo, this.root).split(path.sep).join('/');
+    const reportedRepo = (await this.git(['rev-parse', '--show-toplevel'])).toString('utf8').trim();
+    this.repo = await fs.realpath(reportedRepo);
+    const realRoot = await fs.realpath(this.root);
+    if (!inside(this.repo, realRoot)) throw new Error('The selected folder is outside the Git repository.');
+    this.prefix = path.relative(this.repo, realRoot).split(path.sep).join('/');
     if (this.prefix) this.prefix += '/';
-    if (!inside(this.repo, this.root)) throw new Error('The selected folder is outside the Git repository.');
     if (this.request.source === 'commits') {
       this.base = await this.resolveCommit(this.request.base ?? '');
       this.target = await this.resolveCommit(this.request.target ?? '');
