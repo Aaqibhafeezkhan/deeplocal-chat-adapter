@@ -174,8 +174,72 @@ it('tool progress identifies operation and path without exposing generated conte
   }
 });
 
-function panelHarness(responses: StreamEvent[][]) {
+it('uses the redacted activity for status, live rows and persisted/restored rows without changing execution arguments', async () => {
+  const sentinel = 'syntheticCredential53';
+  const argumentsValue = JSON.stringify({ path: `.env.${sentinel}`, content: 'synthetic file payload' });
+  const sensitiveTool: StreamEvent = { kind: 'toolCall', value: {
+    id: 'sensitive-53', type: 'function', function: { name: 'create_file', arguments: argumentsValue },
+  } };
+  const harness = panelHarness([[sensitiveTool], [{ kind: 'text', value: 'File creation declined.' }]]);
+  harness.send({ type: 'send', text: 'Create the requested configuration', model: 'test' });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'approval')).toBe(true));
+  expect(harness.sent).toContainEqual({ type: 'status', message: 'Create file · [sensitive target redacted]' });
+  const start = harness.sent.find(message => message.type === 'toolStart')!;
+  expect(start.activity).toMatchObject({ detail: '[sensitive target redacted]', state: 'running' });
+  // Approval and execution retain their existing exact target; only activity labels are redacted.
+  const approval = harness.sent.find(message => message.type === 'approval')!;
+  expect(approval.message).toContain(`.env.${sentinel}`);
+  harness.send({ type: 'approval', approvalId: approval.approvalId, approved: false });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'assistantDone')).toBe(true));
+  const activity = harness.sent.find(message => message.type === 'toolResult')!.activity;
+  expect(activity).toMatchObject({ title: 'Create file', detail: '[sensitive target redacted]', state: 'declined' });
+  expect(JSON.stringify(harness.sent.filter(message => message.type === 'status' || message.type === 'toolStart' || message.type === 'toolResult'))).not.toContain(sentinel);
+  expect(harness.requests[1].messages.find(message => message.tool_calls)?.tool_calls?.[0].function.arguments).toBe(argumentsValue);
+  expect(env.apply).not.toHaveBeenCalled();
+  const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ id: string; transcript: Array<{ role: string; activity?: unknown }> }>;
+  expect(sessions[0].transcript.find(item => item.role === 'Tool')?.activity).toEqual(activity);
+  harness.send({ type: 'switchSession', sessionId: sessions[0].id });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'restore')).toBe(true));
+  const restored = harness.sent.find(message => message.type === 'restore')!;
+  expect(JSON.stringify(restored)).toContain('[sensitive target redacted]');
+  expect(JSON.stringify(restored)).not.toContain(sentinel);
+});
+
+it('redacts recognizable sensitive labels saved before the update when restoring activity', async () => {
+  const sentinel = 'syntheticCredential53';
+  const harness = panelHarness([], [{
+    role: 'Tool', text: 'create_file\nUser declined file change.',
+    activity: { id: 'old-53', title: 'Create file', detail: `.env.${sentinel}`, state: 'declined' },
+  }, {
+    role: 'Tool', text: 'run_command\nUser declined command execution.',
+    activity: { id: 'attached-53', title: 'Run command', detail: 'docker run --env-file=.env.production demo-image', state: 'declined' },
+  }, {
+    role: 'Tool', text: 'read_file\nRead complete.',
+    activity: { id: 'ordinary', title: 'Read file', detail: 'src/config.ts', state: 'success' },
+  }, {
+    role: 'Tool', text: 'read_file\nMissing saved target.',
+    activity: { id: 'invalid', title: 'Read file', detail: null, state: 'error' },
+  }]);
+  harness.send({ type: 'switchSession', sessionId: 'stored' });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'restore')).toBe(true));
+  const restored = harness.sent.find(message => message.type === 'restore')!;
+  expect(JSON.stringify(restored)).toContain('[sensitive target redacted]');
+  expect(JSON.stringify(restored)).toContain('src/config.ts');
+  expect(JSON.stringify(restored)).not.toContain(sentinel);
+  expect(JSON.stringify(restored)).not.toContain('.env.production');
+  expect(restored.items).toEqual(expect.arrayContaining([expect.objectContaining({
+    activity: { id: 'attached-53', title: 'Run command', detail: '[sensitive target redacted]', state: 'declined' },
+  })]));
+  expect(restored.items).toEqual(expect.arrayContaining([expect.objectContaining({
+    activity: { id: 'invalid', title: 'Read file', detail: '', state: 'error' },
+  })]));
+});
+
+function panelHarness(responses: StreamEvent[][], savedItems?: Array<Record<string, unknown>>) {
   const state = new Map<string, unknown>();
+  if (savedItems) state.set('deeplocal.sessions.folders:/project', [{
+    id: 'stored', title: 'Saved task', updatedAt: 1, history: [], transcript: savedItems,
+  }]);
   const memento = { get: (key: string, fallback: unknown) => state.get(key) ?? fallback,
     update: async (key: string, value: unknown) => { state.set(key, structuredClone(value)); } };
   const sent: Array<Record<string, unknown>> = [];

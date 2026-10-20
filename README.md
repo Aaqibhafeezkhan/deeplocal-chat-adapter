@@ -124,6 +124,15 @@ inputs are rejected by file tools. Conversation history is retained when you
 change folders. Existing symlink following and command permissions are unchanged;
 the folder selection is not an operating-system sandbox.
 
+Tool activity labels show only the action and a short target. Recognized sensitive
+filenames (such as `.env`, credential files and private keys), authorization text,
+credential assignments/options and URL credentials are replaced with
+`[sensitive target redacted]` before the label is shortened. Ordinary paths and
+search terms remain visible. Recognizable sensitive labels in saved activity are
+also redacted when displayed again. These are limited presentation rules, not a
+complete secret scanner; approval prompts, tool results and model conversation
+history retain their existing behavior.
+
 `read_file` reads UTF-8 text. Files containing NUL bytes or invalid UTF-8 return
 an error identifying the workspace-relative path instead of their contents.
 
