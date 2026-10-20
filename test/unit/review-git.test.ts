@@ -168,6 +168,28 @@ it('rejects cancelled reviews before launching Git', async () => {
   await expect(createGitReview(root, { source: 'unstaged' }, abort.signal)).rejects.toThrow('cancelled');
 });
 
+it('rejects cached unstaged evidence after the working file changes', async () => {
+  await write('sample.txt', 'base\n');
+  commit('base');
+  await write('sample.txt', 'first change\n');
+  const review = await createGitReview(root, { source: 'unstaged' });
+  expect(await review.readFile('sample.txt')).toBe('first change\n');
+  await write('sample.txt', 'second change\n');
+  await expect(review.readFile('sample.txt')).rejects.toThrow('changed');
+});
+
+it('rejects cached staged evidence after the index changes', async () => {
+  await write('sample.txt', 'base\n');
+  commit('base');
+  await write('sample.txt', 'first change\n');
+  git('add', 'sample.txt');
+  const review = await createGitReview(root, { source: 'staged' });
+  expect(await review.readFile('sample.txt')).toBe('first change\n');
+  await write('sample.txt', 'second change\n');
+  git('add', 'sample.txt');
+  await expect(review.readFile('sample.txt')).rejects.toThrow('changed');
+});
+
 it('bounds search matches and refuses oversized unchanged source context', async () => {
   await write('many.txt', 'needle\n'.repeat(110));
   await write('large-context.txt', 'x'.repeat(60_001));
