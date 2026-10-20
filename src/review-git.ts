@@ -42,6 +42,7 @@ export class GitReviewSnapshot implements ReviewEvidenceSource {
   private targetTree: Tree = new Map();
   private readonly cache = new Map<string, string>();
   private readonly workingReads = new Map<string, Buffer>();
+  private readonly disabledFilters: Array<[string, string]> = [];
 
   constructor(private readonly root: string, readonly request: ReviewRequest, private readonly signal?: AbortSignal) {}
 
@@ -49,15 +50,32 @@ export class GitReviewSnapshot implements ReviewEvidenceSource {
     if (this.signal?.aborted) throw new Error('Code review cancelled.');
   }
 
-  private async git(args: string[], limit = 8_000_000): Promise<Buffer> {
+  private async git(args: string[], limit = 8_000_000, allowNoConfigMatches = false): Promise<Buffer> {
     this.checkCancelled();
+    const inheritedCount = Number(process.env.GIT_CONFIG_COUNT ?? '0');
+    if (!Number.isSafeInteger(inheritedCount) || inheritedCount < 0) throw new Error('Invalid inherited Git configuration count.');
+    const env: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_COUNT: String(inheritedCount + this.disabledFilters.length), GIT_NO_LAZY_FETCH: '1' };
+    this.disabledFilters.forEach(([key, value], index) => {
+      env[`GIT_CONFIG_KEY_${inheritedCount + index}`] = key;
+      env[`GIT_CONFIG_VALUE_${inheritedCount + index}`] = value;
+    });
+    // Git applies inherited GIT_CONFIG_PARAMETERS after counted environment
+    // entries. Explicit command config must override those inherited filters.
+    const filterArgs: string[] = [];
+    if (process.env.GIT_CONFIG_PARAMETERS) {
+      for (const [key, value] of this.disabledFilters) {
+        if (key.includes('=')) throw new Error('Read-only review cannot safely override this inherited Git filter configuration.');
+        filterArgs.push('-c', `${key}=${value}`);
+      }
+    }
     return new Promise((resolve, reject) => {
-      execFile('git', ['--no-optional-locks', '--no-pager', '-c', 'core.quotepath=true', ...args], {
+      execFile('git', ['--no-optional-locks', '--no-pager', '-c', 'core.quotepath=true', '-c', 'core.fsmonitor=false', '-c', 'diff.autoRefreshIndex=false', ...filterArgs, ...args], {
         cwd: this.repo || this.root, encoding: 'buffer', maxBuffer: limit, timeout: 30_000,
-        signal: this.signal, windowsHide: true,
+        signal: this.signal, windowsHide: true, env,
       }, (error, stdout, stderr) => {
         if (error) {
-          if (this.signal?.aborted) reject(new Error('Code review cancelled.'));
+          if (allowNoConfigMatches && 'code' in error && error.code === 1) resolve(stdout);
+          else if (this.signal?.aborted) reject(new Error('Code review cancelled.'));
           else if ('code' in error && error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') reject(new Error('Review evidence exceeds its size limit.'));
           else reject(new Error(`Git review failed: ${String(stderr).trim() || error.message}`));
         } else resolve(stdout);
@@ -142,6 +160,26 @@ export class GitReviewSnapshot implements ReviewEvidenceSource {
   }
 
   async initialize(): Promise<this> {
+    // Config inspection does not refresh the index or convert worktree content.
+    // Environment config entries preserve arbitrary filter subsection names
+    // without interpreting them as options, shell text, or key=value arguments.
+    const filterKeys = (await this.git(['config', '--null', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|process|required)$'], 8_000_000, true)).toString('utf8').split('\0');
+    const filters = new Set(filterKeys.filter(Boolean).map(key => key.replace(/\.(clean|process|required)$/i, '')));
+    for (const filter of filters) {
+      this.disabledFilters.push([`${filter}.clean`, ''], [`${filter}.process`, ''], [`${filter}.required`, 'false']);
+    }
+    if (filters.size) this.limitations.push('Configured Git clean/process filters were disabled; unstaged comparisons use saved content without those filter transformations.');
+    const partialConfig = (await this.git(['config', '--null', '--get-regexp', '^(extensions\\.partialclone|remote\\..*\\.promisor)$'], 8_000_000, true)).toString('utf8');
+    const partialSettings = new Map<string, string>();
+    for (const setting of partialConfig.split('\0').filter(Boolean)) {
+      const separator = setting.indexOf('\n');
+      partialSettings.set(setting.slice(0, separator), setting.slice(separator + 1).trim());
+    }
+    const partial = [...partialSettings].some(([key, value]) => /^extensions\.partialclone$/i.test(key)
+      ? Boolean(value) : !/^(false|no|off|[+-]?0+)$/i.test(value));
+    if (partial) {
+      throw new Error('Partial/promisor clones are not supported by read-only review; use a complete local clone.');
+    }
     this.repo = (await this.git(['rev-parse', '--show-toplevel'])).toString('utf8').trim();
     this.prefix = path.relative(this.repo, this.root).split(path.sep).join('/');
     if (this.prefix) this.prefix += '/';

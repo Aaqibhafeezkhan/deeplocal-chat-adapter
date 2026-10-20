@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createGitReview } from '../../src/review-git';
 
 let root: string;
@@ -25,7 +25,7 @@ beforeEach(async () => {
   git('config', 'user.email', 'review@example.invalid');
   git('config', 'core.autocrlf', 'false');
 });
-afterEach(async () => { await fs.rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); });
 
 it('pins staged blobs while the saved working tree differs', async () => {
   await write('sample.txt', 'base\n');
@@ -182,7 +182,7 @@ it('bounds search matches and refuses oversized unchanged source context', async
   await expect(review.readFile('large-context.txt')).rejects.toThrow('limit');
 });
 
-it('rejects a working-tree path replaced by a symlink outside the selected root', async () => {
+it('rejects a working-tree path replaced by a symlink outside the selected root', async context => {
   await write('folder/inside.txt', 'inside\n');
   await write('outside.txt', 'outside\n');
   commit('base');
@@ -191,9 +191,69 @@ it('rejects a working-tree path replaced by a symlink outside the selected root'
   try { await fs.symlink(path.join(root, 'outside.txt'), path.join(selected, 'inside.txt')); }
   catch (error) {
     // Windows installations without Developer Mode cannot create file symlinks.
-    if ((error as NodeJS.ErrnoException).code === 'EPERM') return;
+    if ((error as NodeJS.ErrnoException).code === 'EPERM') context.skip();
     throw error;
   }
   const review = await createGitReview(selected, { source: 'unstaged' });
   await expect(review.readFile('inside.txt')).rejects.toThrow('symlink outside');
+});
+
+it.each(['clean', 'process'])('never invokes configured %s filters or fsmonitor helpers', async filter => {
+  await write('.gitattributes', '*.txt filter=audit\n');
+  await write('sample.txt', 'base\n');
+  commit('base');
+  const marker = path.join(root, 'helper-ran');
+  const script = path.join(root, 'configured-helper.cjs');
+  await fs.writeFile(script, 'require("fs").writeFileSync(process.argv[2], "helper executed"); process.exit(0);');
+  const command = `"${process.execPath}" "${script}" "${marker}"`;
+  git('config', `filter.audit.${filter}`, command);
+  git('config', 'filter.audit.required', 'true');
+  git('config', 'core.fsmonitor', command);
+  git('config', 'diff.autoRefreshIndex', 'true');
+  await write('sample.txt', 'saved change\n');
+  const indexPath = path.join(root, '.git', 'index');
+  const index = await fs.readFile(indexPath);
+  const review = await createGitReview(root, { source: 'unstaged' });
+  expect(await review.readFile('sample.txt')).toBe('saved change\n');
+  await review.verifyUnchanged();
+  expect(review.limitations.join(' ')).toContain('filters were disabled');
+  await expect(fs.stat(marker)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await fs.readFile(indexPath)).toEqual(index);
+  expect(await fs.readFile(path.join(root, 'sample.txt'), 'utf8')).toBe('saved change\n');
+});
+
+it('preserves inherited Git config while overriding its executable filters', async () => {
+  await write('.gitattributes', '*.txt filter=inherited\n');
+  await write('sample.txt', 'base\n');
+  commit('base');
+  await write('sample.txt', 'saved\n');
+  git('config', 'remote.not-partial.promisor', 'false');
+  vi.stubEnv('GIT_CONFIG_COUNT', '1');
+  vi.stubEnv('GIT_CONFIG_KEY_0', 'filter.inherited.clean');
+  vi.stubEnv('GIT_CONFIG_VALUE_0', 'this-helper-must-never-execute');
+  vi.stubEnv('GIT_CONFIG_PARAMETERS', "'filter.inherited.clean=this-helper-must-never-execute' 'filter.inherited.required=true'");
+  const review = await createGitReview(root, { source: 'unstaged' });
+  expect(review.limitations.join(' ')).toContain('filters were disabled');
+  expect(await review.readFile('sample.txt')).toBe('saved\n');
+  await review.verifyUnchanged();
+});
+
+it('does not fetch missing promisor objects or launch a remote helper', async () => {
+  await write('sample.txt', 'base\n');
+  const target = commit('base');
+  const blob = git('rev-parse', 'HEAD:sample.txt').trim();
+  await fs.rm(path.join(root, '.git', 'objects', blob.slice(0, 2), blob.slice(2)));
+  const marker = path.join(root, 'remote-ran');
+  const script = path.join(root, 'remote-helper.cjs');
+  await fs.writeFile(script, 'require("fs").writeFileSync(process.argv[2], "remote executed"); process.exit(0);');
+  const extArgument = (value: string) => value.replace(/%/g, '%%').replace(/ /g, '% ');
+  git('config', 'remote.audit.url', `ext::${[process.execPath, script, marker].map(extArgument).join(' ')}`);
+  git('config', 'remote.audit.promisor', 'true');
+  git('config', 'protocol.ext.allow', 'always');
+  await expect(createGitReview(root, { source: 'commits', base: target, target })).rejects.toThrow('Partial/promisor clones are not supported');
+  await expect(fs.stat(marker)).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(fs.stat(path.join(root, '.git', 'objects', blob.slice(0, 2), blob.slice(2)))).rejects.toMatchObject({ code: 'ENOENT' });
+  // Positive control: ordinary Git really would invoke this fixture helper.
+  expect(() => git('cat-file', 'blob', blob)).toThrow();
+  expect(await fs.readFile(marker, 'utf8')).toBe('remote executed');
 });

@@ -167,7 +167,10 @@ to paste into a pull request; it does not connect to or post on GitHub. Complete
 reports are retained in the existing workspace session history.
 
 Git must be available, and the selected local workspace folder must be inside a
-Git repository. Reviews cover tracked, saved files only: untracked files and
+complete Git repository. Partial/promisor clones are rejected because reading
+missing objects can trigger a fetch. Repository-configured executable Git helpers
+are disabled during review; any disabled content filters are reported as a
+limitation. Reviews cover tracked, saved files only: untracked files and
 unsaved editor buffers are excluded. Staged reviews inspect index content;
 commit reviews inspect the selected revisions. An unstaged review is rejected
 if its underlying changes or inspected saved files change before completion.
