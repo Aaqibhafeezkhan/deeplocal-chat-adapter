@@ -202,7 +202,9 @@ export class GitReviewSnapshot implements ReviewEvidenceSource {
     const nameSnapshot = (await this.git(this.diffArgs('names'))).toString('utf8');
     const names = nameSnapshot.split('\0');
     this.initialPatch = await this.patch();
-    if ((await this.git(this.diffArgs('names'))).toString('utf8') !== nameSnapshot) throw new Error('Git review source changed. Start a new review.');
+    if ((await this.git(this.diffArgs('names'))).toString('utf8') !== nameSnapshot || await this.patch() !== this.initialPatch) {
+      throw new Error('Git review source changed. Start a new review.');
+    }
     const sections = this.initialPatch.split(/(?=^diff --git )/m).filter(Boolean);
     let sectionIndex = 0;
     const selectedSections: string[] = [];
@@ -259,7 +261,10 @@ export class GitReviewSnapshot implements ReviewEvidenceSource {
     if (side !== 'base' && side !== 'target') throw new Error('Invalid review source side.');
     const key = `${side}:${relative}`;
     const cached = this.cache.get(key);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+      if (verify) await this.verifyUnchanged();
+      return cached;
+    }
     const tree = side === 'base' ? this.baseTree : this.targetTree;
     const entry = tree.get(relative);
     if (!entry) throw new Error(`File is not present in the selected ${side} snapshot: ${relative}`);
