@@ -5,11 +5,11 @@ models and remote OpenAI-compatible APIs to VS Code chat. It provides a
 sidebar for conversational coding tasks and registers discovered models in the
 VS Code chat model picker.
 
-<img width="1437" height="738" alt="DeepLocal sidebar" src="https://github.com/user-attachments/assets/64afc29a-32dd-4a6c-844b-379beafe91cc" />
-<br>
-<img width="1309" height="737" alt="DeepLocal task view" src="https://github.com/user-attachments/assets/36a5d81c-5efb-493a-80aa-c7b072f9701f" />
-<br>
-<img width="1433" height="707" alt="Image" src="https://github.com/user-attachments/assets/0aaa5510-024a-418b-a7d5-82ee34789461" />
+![DeepLocal sidebar](https://github.com/user-attachments/assets/64afc29a-32dd-4a6c-844b-379beafe91cc)
+
+![DeepLocal task view](https://github.com/user-attachments/assets/36a5d81c-5efb-493a-80aa-c7b072f9701f)
+
+![DeepLocal extension screenshot](https://github.com/user-attachments/assets/0aaa5510-024a-418b-a7d5-82ee34789461)
 
 ## Install from VS Code Marketplace (recommended)
 
