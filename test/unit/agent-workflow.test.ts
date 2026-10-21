@@ -4,7 +4,7 @@ import { posix as path } from 'node:path';
 import { ChatPanel } from '../../src/chat-panel';
 import * as vscode from 'vscode';
 import { invokeAgentTool } from '../../src/agent-tools';
-import { ChatCompletionRequest, StreamEvent } from '../../src/protocol';
+import { ChatCompletionRequest, ChatMessage, StreamEvent } from '../../src/protocol';
 import { toolActivity } from '../../src/tool-activity';
 
 const env = vi.hoisted(() => ({
@@ -235,10 +235,66 @@ it('redacts recognizable sensitive labels saved before the update when restoring
   })]));
 });
 
-function panelHarness(responses: StreamEvent[][], savedItems?: Array<Record<string, unknown>>) {
+it('summarizes the latest visible user request without changing saved titles or exposing model/tool text', async () => {
+  const latest = '  Follow up\n日本語 👩🏽‍💻 <img src=x onerror="synthetic57()"> & "quotes" ' + 'context '.repeat(40);
+  const items = [
+    { role: 'You', text: 'First request' },
+    { role: 'DeepLocal', text: 'Earlier answer' },
+    { role: 'You', text: latest },
+    { role: 'Summary', text: 'Provider summary must not be used' },
+    { role: 'Tool', text: 'Tool result must not be used' },
+    { role: 'DeepLocal', text: 'Latest answer must not be used' },
+  ];
+  const harness = panelHarness([], items, [{ role: 'user', content: 'Model-only history' }]);
+  harness.send({ type: 'switchSession', sessionId: 'stored' });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'sessions')).toBe(true));
+  expect(harness.sent.find(message => message.type === 'sessions')).toEqual({
+    type: 'sessions', activeSessionId: 'stored',
+    sessions: [{ id: 'stored', title: 'Saved task', preview: latest, updatedAt: 1 }],
+  });
+  const stored = harness.state.get('deeplocal.sessions.folders:/project') as Array<Record<string, unknown>>;
+  expect(stored[0].title).toBe('Saved task');
+  expect(stored[0].transcript).toEqual(items);
+  expect(stored[0]).not.toHaveProperty('preview');
+});
+
+it.each([
+  [[], [], ''],
+  [[{ role: 'DeepLocal', text: 'No user request yet' }], [], ''],
+  [[{ role: 'You', text: ' \n\t ' }], [{ role: 'user', content: 'Older request' }], ' \n\t '],
+  [[{ role: 'Tool', text: 'Retained tool result' }], [
+    { role: 'user', content: 'Older request' }, { role: 'user', content: 'Latest retained request' }, { role: 'tool', content: 'Tool result' },
+  ], 'Latest retained request'],
+  [[], [{ role: 'user', content: null }], ''],
+])('handles empty or trimmed session transcripts (%#)', async (items, history, expected) => {
+  const harness = panelHarness([], items as Array<Record<string, unknown>>, history as ChatMessage[]);
+  harness.send({ type: 'switchSession', sessionId: 'stored' });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'sessions')).toBe(true));
+  expect(harness.sent.find(message => message.type === 'sessions')).toMatchObject({ sessions: [{ preview: expected }] });
+});
+
+it('updates session previews after follow-ups and preserves selection, titles and the persistence format', async () => {
+  const harness = panelHarness([[{ kind: 'text', value: 'First answer' }], [{ kind: 'text', value: 'Second answer' }]]);
+  harness.send({ type: 'send', text: 'Original title', model: 'test', useAgent: false });
+  await vi.waitFor(() => expect(harness.sent.filter(message => message.type === 'assistantDone')).toHaveLength(1));
+  harness.send({ type: 'send', text: 'Latest request\nwith more detail', model: 'test', useAgent: false });
+  await vi.waitFor(() => expect(harness.sent.filter(message => message.type === 'assistantDone')).toHaveLength(2));
+  const previous = harness.sent.filter(message => message.type === 'sessions').at(-1)!;
+  expect(previous).toMatchObject({ sessions: [{ title: 'Original title', preview: 'Latest request\nwith more detail' }] });
+  harness.send({ type: 'newSession' });
+  await vi.waitFor(() => expect(harness.sent.filter(message => message.type === 'sessions').at(-1)?.activeSessionId).not.toBe(previous.activeSessionId));
+  expect(harness.sent.filter(message => message.type === 'sessions').at(-1)).toMatchObject({ sessions: expect.arrayContaining([expect.objectContaining({ title: 'New session', preview: '' })]) });
+  harness.send({ type: 'switchSession', sessionId: previous.activeSessionId });
+  await vi.waitFor(() => expect(harness.sent.filter(message => message.type === 'sessions').at(-1)?.activeSessionId).toBe(previous.activeSessionId));
+  expect(harness.state.get('deeplocal.activeSessionId.folders:/project')).toBe(previous.activeSessionId);
+  const stored = harness.state.get('deeplocal.sessions.folders:/project') as Array<Record<string, unknown>>;
+  expect(stored.every(session => !('preview' in session))).toBe(true);
+});
+
+function panelHarness(responses: StreamEvent[][], savedItems?: Array<Record<string, unknown>>, savedHistory: ChatMessage[] = []) {
   const state = new Map<string, unknown>();
   if (savedItems) state.set('deeplocal.sessions.folders:/project', [{
-    id: 'stored', title: 'Saved task', updatedAt: 1, history: [], transcript: savedItems,
+    id: 'stored', title: 'Saved task', updatedAt: 1, history: savedHistory, transcript: savedItems,
   }]);
   const memento = { get: (key: string, fallback: unknown) => state.get(key) ?? fallback,
     update: async (key: string, value: unknown) => { state.set(key, structuredClone(value)); } };

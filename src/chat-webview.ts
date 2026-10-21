@@ -419,7 +419,20 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       if (activeSessionId && activeSessionId !== msg.activeSessionId) drafts.set(activeSessionId, prompt.value);
       const changed = activeSessionId !== msg.activeSessionId;
       activeSessionId = msg.activeSessionId;
-      byId('session').replaceChildren(...msg.sessions.map(item => { const option = document.createElement('option'); option.value = item.id; option.textContent = item.title; option.selected = item.id === activeSessionId; return option; }));
+      byId('session').replaceChildren(...msg.sessions.map(item => {
+        const option = document.createElement('option');
+        const preview = (item.preview || '').replace(/\s+/g, ' ').trim();
+        const characters = Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(preview), part => part.segment);
+        const shortPreview = characters.length > 60 ? characters.slice(0, 60).join('') + '…' : preview;
+        const label = item.title + (preview ? ' — ' + preview : '');
+        option.value = item.id;
+        option.textContent = item.title + (shortPreview ? ' — ' + shortPreview : '');
+        option.title = label;
+        option.setAttribute('aria-label', label);
+        option.selected = item.id === activeSessionId;
+        return option;
+      }));
+      byId('session').title = byId('session').selectedOptions[0]?.title || '';
       byId('taskTitle').textContent = msg.sessions.find(item => item.id === activeSessionId)?.title || 'New task';
       if (changed) prompt.value = drafts.get(activeSessionId) || '';
       resizePrompt();

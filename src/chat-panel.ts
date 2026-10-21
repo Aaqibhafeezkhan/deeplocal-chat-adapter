@@ -742,6 +742,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       sessions: this.sessions.map((session) => ({
         id: session.id,
         title: session.title,
+        preview: sessionPreview(session),
         updatedAt: session.updatedAt,
       })),
     });
@@ -877,6 +878,20 @@ function createSession(): ChatSession {
 
 function createId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function sessionPreview(session: ChatSession): string {
+  // Visible requests also cover Review mode, which keeps model history separate.
+  for (let index = session.transcript.length - 1; index >= 0; index--) {
+    const item = session.transcript[index];
+    if (item.role === 'You') return item.text;
+  }
+  // A long tool run can push the user row outside the retained transcript.
+  for (let index = session.history.length - 1; index >= 0; index--) {
+    const message = session.history[index];
+    if (message.role === 'user') return typeof message.content === 'string' ? message.content : '';
+  }
+  return '';
 }
 
 function makeTitle(text: string): string {

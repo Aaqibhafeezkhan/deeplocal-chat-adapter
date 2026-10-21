@@ -68,4 +68,74 @@ suite('deeplocal-chat-adapter Extension Host', () => {
     assert.equal(result.status, 'success');
     assert.equal(result.content, 'automatic single folder');
   });
+
+  test('restores the latest request preview and selection without adding persisted fields', async () => {
+    buildSync({ entryPoints: [path.join(__dirname, '../../src/chat-panel.ts')], bundle: true,
+      platform: 'node', format: 'cjs', external: ['vscode'], outfile: path.join(__dirname, '../../out/session-preview-panel.cjs') });
+    const { ChatPanel, workspaceIdentity } = require('../../out/session-preview-panel.cjs');
+    const scope = workspaceIdentity();
+    const key = `deeplocal.sessions.${scope}`;
+    const activeKey = `deeplocal.activeSessionId.${scope}`;
+    const latest = 'Latest request\n日本語 👩🏽‍💻 <img src=x onerror="synthetic57()"> & "quotes"';
+    const values = new Map([[activeKey, 'saved'], [key, [{
+      id: 'saved', title: 'Existing title', updatedAt: 1,
+      history: [{ role: 'user', content: 'First request' }, { role: 'user', content: latest }],
+      transcript: [{ role: 'You', text: 'First request' }, { role: 'You', text: latest }, { role: 'Tool', text: 'Unrelated result' }],
+    }, { id: 'empty', title: 'New session', updatedAt: 0, history: [], transcript: [] }]]]);
+    const memento = { get: (key, fallback) => values.get(key) ?? fallback,
+      update: async (key, value) => { values.set(key, structuredClone(value)); } };
+    const requests = [];
+    const client = { listModels: async () => [{ id: 'session-test' }], modelInformation: () => ({ toolCalling: true }), cancel() {},
+      streamChat: async function* (_id, request) { requests.push(request); yield { kind: 'text', value: 'Synthetic answer' }; } };
+    const subscriptions = [];
+    const panels = [];
+    const mount = () => {
+      const posts = [];
+      let receive, dispose;
+      const panel = new ChatPanel({ subscriptions, workspaceState: memento, globalState: memento }, client, { error() {} },
+        { get: async () => undefined, set: async () => {}, clear: async () => {} });
+      panel.resolveWebviewView({ onDidDispose: callback => { dispose = callback; }, webview: {
+        cspSource: 'vscode-webview:', onDidReceiveMessage: callback => { receive = callback; },
+        postMessage: message => { posts.push(message); return Promise.resolve(true); },
+      } });
+      panels.push(() => dispose());
+      return { posts, send: message => receive(message) };
+    };
+    const waitFor = async predicate => {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      assert.fail('Timed out waiting for session messages');
+    };
+    try {
+      const first = mount();
+      first.send({ type: 'ready' });
+      await waitFor(() => first.posts.some(message => message.type === 'sessions'));
+      const summary = first.posts.find(message => message.type === 'sessions');
+      assert.equal(summary.activeSessionId, 'saved');
+      assert.equal(summary.sessions[0].preview, latest);
+      assert.equal(summary.sessions[0].title, 'Existing title');
+      assert.equal(summary.sessions[1].preview, '');
+      const followup = 'Follow-up request with extra context';
+      first.send({ type: 'send', text: followup, model: 'session-test', useAgent: false });
+      await waitFor(() => first.posts.some(message => message.type === 'assistantDone'));
+      assert.equal(first.posts.filter(message => message.type === 'sessions').at(-1).sessions[0].preview, followup);
+      assert.equal(requests[0].messages.filter(message => message.role === 'user').at(-1).content, followup);
+      first.send({ type: 'switchSession', sessionId: 'empty' });
+      await waitFor(() => values.get(activeKey) === 'empty');
+      const restored = mount();
+      restored.send({ type: 'ready' });
+      await waitFor(() => restored.posts.some(message => message.type === 'sessions'));
+      const restoredSummary = restored.posts.find(message => message.type === 'sessions');
+      assert.equal(restoredSummary.activeSessionId, 'empty');
+      assert.equal(restoredSummary.sessions.find(session => session.id === 'saved').preview, followup);
+      assert.equal(values.get(key).find(session => session.id === 'saved').title, 'Existing title');
+      assert.ok(values.get(key).every(session => !('preview' in session)));
+    } finally {
+      for (const dispose of panels) dispose();
+      for (const subscription of subscriptions) subscription.dispose();
+    }
+  });
 });
