@@ -9,7 +9,7 @@ VS Code chat model picker.
 <br>
 <img width="1309" height="737" alt="DeepLocal task view" src="https://github.com/user-attachments/assets/36a5d81c-5efb-493a-80aa-c7b072f9701f" />
 <br>
-<img width="1433" height="707" alt="Image" src="https://github.com/user-attachments/assets/191c8312-e4bf-489b-901f-3d6a4763cd46" />
+<img width="1433" height="707" alt="Image" src="https://github.com/user-attachments/assets/0aaa5510-024a-418b-a7d5-82ee34789461" />
 
 ## Install from GitHub Releases
 
