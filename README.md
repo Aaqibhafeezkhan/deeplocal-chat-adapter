@@ -40,9 +40,102 @@ Replace the example filename with the VSIX version you downloaded. The `code` co
 
 VSIX installations from GitHub Releases generally require manually downloading and installing newer versions. The VSIX contains the extension, not the DeepLocal model service.
 
-## Build and publish a VSIX
+## Maintainer release guide: Marketplace and GitHub Releases
 
-For maintainers, this repository already provides a VSIX packaging script:
+**Use the publisher management page to update an existing extension.** The public
+[Marketplace listing](https://marketplace.visualstudio.com/items?itemName=petertzy.deeplocal-chat-adapter)
+is for installing and viewing the extension; it does **not** provide an update
+button for maintainers.
+
+| Purpose | URL |
+| --- | --- |
+| Install or view the extension | [Public Marketplace listing](https://marketplace.visualstudio.com/items?itemName=petertzy.deeplocal-chat-adapter) |
+| Upload a new version | [Marketplace publisher management](https://marketplace.visualstudio.com/manage/publishers/) |
+| Download or publish a VSIX release | [GitHub Releases](https://github.com/petertzy/deeplocal-chat-adapter/releases) |
+
+The publisher ID is `petertzy`, and the full extension ID is
+`petertzy.deeplocal-chat-adapter`. Keep `"publisher": "petertzy"` in
+`package.json` for every release.
+
+### Release checklist (example: 0.1.0 to 0.1.1)
+
+1. Finish the code and documentation changes. Commit them, and ensure the Git
+   working tree is clean. Check with `git status`. Confirm the current version
+   and publisher in `package.json`.
+2. Run `npm version patch` to increment `0.1.0` to `0.1.1`. By default,
+   this updates `package.json` and `package-lock.json`, creates a Git commit,
+   and creates the `v0.1.1` Git tag. Do **not** run it again for the same release
+   or create a duplicate tag. For minor or major releases, use
+   `npm version minor` or `npm version major` instead.
+3. Run the checks and build the distributable VSIX:
+
+   ```bash
+   npm ci
+   npm run check
+   npm run package:vsix
+   ```
+
+   For version `0.1.1`, the expected output is
+   `deeplocal-chat-adapter-0.1.1.vsix` in the repository root. Test the
+   packaged extension in VS Code before publishing.
+4. Push the release commit and its tag:
+
+   ```bash
+   git push origin main
+   git push origin v0.1.1
+   ```
+
+   Replace `main` if releasing from a different branch. Confirm that the
+   tag points to the source used to build the VSIX.
+5. Open [Marketplace publisher management](https://marketplace.visualstudio.com/manage/publishers/),
+   sign in, select **petertzy**, and find the existing
+   **deeplocal-chat-adapter** extension. Open its **...** actions menu and
+   choose **Update** (or the corresponding update/upload action). Upload
+   `deeplocal-chat-adapter-0.1.1.vsix`. **Do not choose + New extension**:
+   that is for creating a separate listing, not updating this one.
+6. Wait until Marketplace verification finishes. Confirm that the existing
+   extension shows version `0.1.1` and **Public** availability.
+7. Open [GitHub Releases](https://github.com/petertzy/deeplocal-chat-adapter/releases),
+   select **Draft a new release**, choose the existing `v0.1.1` tag, add
+   English release notes, attach the **same**
+   `deeplocal-chat-adapter-0.1.1.vsix`, and publish the release.
+   Do not overwrite the previous `v0.1.0` release.
+8. Verify the [public Marketplace listing](https://marketplace.visualstudio.com/items?itemName=petertzy.deeplocal-chat-adapter)
+   and install or update the extension in VS Code. Marketplace-installed copies
+   can receive VS Code automatic updates when **Auto Update** is enabled;
+   manually installed GitHub VSIX copies generally require manual updates.
+
+**Version consistency:** Each release should have matching `package.json`,
+`package-lock.json`, Git tag, Marketplace version, and VSIX filename, all
+built from the same committed source. `npm run package:vsix` only creates the
+VSIX; it does not publish it. The original `v0.1.0` Git tag still contains
+the old publisher value `local-dev`, even though the repackaged Marketplace
+and GitHub VSIX uses `petertzy`. Preserve that published tag; ensure the next
+release is consistent rather than force-moving old tags.
+
+### Troubleshooting Marketplace publishing
+
+- **No update button on the extension's public page:** Use the
+  [publisher management page](https://marketplace.visualstudio.com/manage/publishers/),
+  not the public listing. Open the existing extension's actions menu.
+- **Version already exists or upload is rejected:** Increase the version,
+  rebuild the VSIX, and upload the new package. Do not try to publish a new
+  Marketplace version with the same version number.
+- **Verifying status:** Wait for the Marketplace verification result before
+  assuming the new version is publicly available.
+- **No README available in VS Code immediately after publishing:** Check the
+  [Marketplace web listing](https://marketplace.visualstudio.com/items?itemName=petertzy.deeplocal-chat-adapter).
+  If the README is visible there, try **Developer: Reload Window** or wait
+  for Marketplace metadata to propagate before rebuilding.
+- **Trust publisher warning:** First-time installs may ask the user to trust
+  publisher `petertzy`. This is a normal security prompt. Marketplace
+  approval and publisher verification are separate.
+- **Marketplace updates do not reach a manually installed VSIX:** Prefer
+  installing from the Marketplace for built-in automatic updates.
+
+## Build a VSIX without publishing
+
+To build a VSIX for local testing without creating a new release:
 
 ```bash
 npm ci
@@ -50,35 +143,10 @@ npm run check
 npm run package:vsix
 ```
 
-The last command runs the production prepublish build and produces `deeplocal-chat-adapter-<version>.vsix` in the repository root. Confirm the extension works in VS Code before publishing.
-
-To publish a release manually:
-
-1. Ensure the intended source changes are committed and pushed to GitHub.
-2. Open the [Releases page](https://github.com/petertzy/deeplocal-chat-adapter/releases) and choose **Draft a new release**.
-3. Choose an existing version tag or create a new one such as `v0.1.0` (without spaces), targeting the commit used to build the VSIX.
-4. Enter a release title and release notes.
-5. Upload the generated `.vsix` file under **Assets**.
-6. Review the tag, notes, and attached file, then choose **Publish release**.
-
-Keep the tag, extension version in `package.json`, and packaged VSIX version consistent. GitHub Releases publishing is currently a manual process; the `package:vsix` script only builds the package and does not upload it.
-
-
-### Publish to the VS Code Marketplace
-
-The Marketplace publisher is `petertzy`, and the extension identifier is `petertzy.deeplocal-chat-adapter`. Before packaging, verify that `package.json` uses `"publisher": "petertzy"` and that the version is the intended release version.
-
-1. Commit and push the source changes, including any version and publisher metadata changes.
-2. Run `npm ci`, `npm run check`, and `npm run package:vsix`.
-3. Open the [Marketplace publisher management page](https://marketplace.visualstudio.com/manage/publishers/) and select publisher `petertzy`.
-4. Upload the generated VSIX as a new extension version and wait for verification to complete.
-5. Confirm that the extension is listed publicly, then install or update it from the [Marketplace listing](https://marketplace.visualstudio.com/items?itemName=petertzy.deeplocal-chat-adapter).
-6. Publish the same versioned VSIX to GitHub Releases, using a Git tag that points to the source used for the build.
-
-Do not reuse an existing version number for subsequent Marketplace updates. Increment the extension version and ensure that `package.json`, `package-lock.json` (if applicable), the Git tag, and the VSIX correspond to the same source revision. Existing `v0.1.0` tag sources may still contain the earlier `local-dev` publisher value; preserve published tag history and correct this mismatch in a subsequent release rather than rewriting the tag.
-
-A newly published extension may briefly show **No README available** in the VS Code Extensions view while the Marketplace content propagates. If the [Marketplace web listing](https://marketplace.visualstudio.com/items?itemName=petertzy.deeplocal-chat-adapter) displays the README, try **Developer: Reload Window** or check again later before rebuilding.
-
+To install a generated VSIX manually, use **Extensions → ... → Install from
+VSIX...** or run `code --install-extension ./deeplocal-chat-adapter-0.1.1.vsix`
+with the filename adjusted to the version you built. The `code` command must
+be available on your PATH.
 
 ## Quick Start & Testing (Debug Mode)
 
