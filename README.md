@@ -145,6 +145,11 @@ The sidebar stores up to 20 recent sessions for each workspace in VS Code
 its rendered transcript. Empty VS Code windows share one session scope because
 they do not have a durable workspace identity.
 
+**Task history** shows each session title followed by a short preview of its
+latest user request. Long previews are shortened without splitting Unicode
+characters; the full preview is available in the selector's tooltip and each
+option's accessible label. Empty sessions keep their title alone.
+
 ### Sidebar placement
 
 The Open command reveals the sidebar at its saved VS Code location. To put it

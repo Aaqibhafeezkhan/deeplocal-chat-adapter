@@ -225,6 +225,74 @@ for (const [label, command] of [
   });
 }
 
+for (const theme of ['dark', 'light']) {
+  test(`session previews retain safe full labels, Unicode and keyboard switching in ${theme} narrow sidebars`, async ({ page }, testInfo) => {
+    await page.emulateMedia({ colorScheme: theme as 'dark' | 'light' });
+    if (theme === 'light') await page.addStyleTag({ content: ':root { --vscode-foreground:#222; --vscode-sideBar-background:#f5f5f5; --vscode-descriptionForeground:#555; --vscode-editorWidget-background:#fff; --vscode-dropdown-background:#fff; --vscode-input-background:#fff; --vscode-input-foreground:#222; --vscode-widget-border:#ccc; }' });
+    const preview = '  Inspect\n日本語 👩🏽‍💻 é <img src=x onerror="window.synthetic57=true"> & </option><script>window.synthetic57=true</script> ' + 'more context '.repeat(25);
+    const normalized = preview.replace(/\s+/g, ' ').trim();
+    const sessions = [
+      { id: 'one', title: 'Saved task', preview },
+      { id: 'two', title: 'Saved task', preview: 'Different latest request' },
+      { id: 'empty', title: 'New session', preview: ' \n\t ' },
+      { id: 'legacy', title: 'Previous session' },
+      { id: 'unicode', title: 'Unicode task', preview: 'a'.repeat(59) + '👩🏽‍💻é' },
+      { id: 'boundary', title: 'Boundary task', preview: 'a'.repeat(60) },
+    ];
+    await dispatch(page, { type: 'sessions', activeSessionId: 'one', sessions });
+    await page.getByRole('button', { name: 'Task history', exact: true }).click();
+    const selector = page.locator('#session');
+    await expect(selector).toHaveAccessibleName('Recent tasks in this workspace');
+    const option = selector.locator('option').first();
+    await expect(option).toHaveText('Saved task — Inspect 日本語 👩🏽‍💻 é <img src=x onerror="window.synthetic57=true"…');
+    await expect(option).toHaveAttribute('title', 'Saved task — ' + normalized);
+    await expect(option).toHaveAccessibleName('Saved task — ' + normalized);
+    await expect(selector).toHaveAttribute('title', 'Saved task — ' + normalized);
+    await expect(selector.locator('option').nth(2)).toHaveText('New session');
+    await expect(selector.locator('option').nth(3)).toHaveText('Previous session');
+    await expect(selector.locator('option').nth(4)).toHaveText('Unicode task — ' + 'a'.repeat(59) + '👩🏽‍💻…');
+    await expect(selector.locator('option').nth(5)).toHaveText('Boundary task — ' + 'a'.repeat(60));
+    expect(await selector.locator('img,script').count()).toBe(0);
+    expect(await page.evaluate(() => 'synthetic57' in window)).toBe(false);
+    await page.locator('#prompt').fill('Draft for first task');
+    await page.getByRole('button', { name: 'Close task history', exact: true }).click();
+    for (const width of [260, 340, 480]) {
+      await page.setViewportSize({ width, height: 820 });
+      await page.getByRole('button', { name: 'Task history', exact: true }).click();
+      await expect(selector).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      const bounds = await selector.boundingBox();
+      expect(bounds!.x).toBeGreaterThanOrEqual(0);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
+      await page.screenshot({ path: testInfo.outputPath(`session-preview-${theme}-${width}.png`) });
+      await page.getByRole('button', { name: 'Close task history', exact: true }).click();
+    }
+    await page.getByRole('button', { name: 'Task history', exact: true }).click();
+    await selector.focus();
+    await selector.press('ArrowDown');
+    await expect(selector).toHaveValue('two');
+    expect(await page.evaluate(() => window.__messages.at(-1))).toEqual({ type: 'switchSession', sessionId: 'two' });
+    await expect(page.locator('#historyPanel')).toBeHidden();
+    await dispatch(page, { type: 'sessions', activeSessionId: 'two', sessions });
+    await expect(selector).toHaveAttribute('title', 'Saved task — Different latest request');
+    await expect(page.locator('#taskTitle')).toHaveText('Saved task');
+    await expect(page.locator('#prompt')).toHaveValue('');
+    await page.locator('#prompt').fill('Draft for second task');
+    await dispatch(page, { type: 'sessions', activeSessionId: 'one', sessions });
+    await dispatch(page, { type: 'restore', items: [{ role: 'You', text: preview }] });
+    await expect(page.locator('#prompt')).toHaveValue('Draft for first task');
+    await expect(selector).toHaveValue('one');
+    await dispatch(page, { type: 'sessions', activeSessionId: 'one', sessions: [{ ...sessions[0], preview: 'Updated latest request' }, ...sessions.slice(1)] });
+    await expect(option).toHaveText('Saved task — Updated latest request');
+    await expect(selector).toHaveAttribute('title', 'Saved task — Updated latest request');
+    await dispatch(page, { type: 'assistantStart' });
+    await expect(selector).toBeDisabled();
+    await expect(page.locator('#historyButton')).toBeDisabled();
+    await dispatch(page, { type: 'assistantDone', outcome: 'success' });
+    await expect(selector).toBeEnabled();
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   await page.evaluate(() => {
     window.__messages = [];

@@ -74,6 +74,9 @@ it('reviews an optional prompt with the selected source and isolated history, ev
   expect(h.client.streamChat).not.toHaveBeenCalled();
   const sessions = [...h.state.values()].find(Array.isArray) as Array<{ history: unknown[]; transcript: Array<{ reviewReport?: ReviewReport }> }>;
   expect(sessions[0].history).toEqual([]);
+  expect(h.sent.filter(message => message.type === 'sessions').at(-1)).toMatchObject({
+    sessions: [{ preview: 'Review commit range' }],
+  });
   expect(sessions[0].transcript.at(-1)?.reviewReport).toEqual(report);
   h.send({ type: 'ready' });
   await vi.waitFor(() => expect(h.sent.some(message => message.type === 'restore')).toBe(true));
