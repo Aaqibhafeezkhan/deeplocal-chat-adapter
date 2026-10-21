@@ -9,6 +9,50 @@ VS Code chat model picker.
 <br>
 <img width="1309" height="737" alt="DeepLocal task view" src="https://github.com/user-attachments/assets/36a5d81c-5efb-493a-80aa-c7b072f9701f" />
 
+## Install from GitHub Releases
+
+Download the latest `.vsix` package from the [GitHub Releases page](https://github.com/petertzy/deeplocal-chat-adapter/releases). You do not need Node.js or npm to install a prebuilt VSIX.
+
+1. Download the `deeplocal-chat-adapter-<version>.vsix` file from the release's **Assets** section.
+2. Open VS Code (version 1.104 or later) and go to the **Extensions** view (`Ctrl+Shift+X` on Windows/Linux or `Cmd+Shift+X` on macOS).
+3. Select the **...** menu in the Extensions view and choose **Install from VSIX...**.
+4. Select the downloaded file and reload VS Code if prompted.
+5. Open the Command Palette and run `deeplocal-chat-adapter: Open`.
+6. Configure a running local DeepLocal service or a compatible remote API as described in [Configure a backend](#configure-a-backend).
+
+Alternatively, install the downloaded package from a terminal:
+
+```bash
+code --install-extension ./deeplocal-chat-adapter-0.1.0.vsix
+```
+
+Replace the example filename with the VSIX version you downloaded. The `code` command must be available on your PATH. To replace an already installed copy, you can add `--force`.
+
+VSIX installations from GitHub Releases generally require manually downloading and installing newer versions. The VSIX contains the extension, not the DeepLocal model service.
+
+## Build and publish a VSIX
+
+For maintainers, this repository already provides a VSIX packaging script:
+
+```bash
+npm ci
+npm run check
+npm run package:vsix
+```
+
+The last command runs the production prepublish build and produces `deeplocal-chat-adapter-<version>.vsix` in the repository root. Confirm the extension works in VS Code before publishing.
+
+To publish a release manually:
+
+1. Ensure the intended source changes are committed and pushed to GitHub.
+2. Open the [Releases page](https://github.com/petertzy/deeplocal-chat-adapter/releases) and choose **Draft a new release**.
+3. Choose an existing version tag or create a new one such as `v0.1.0` (without spaces), targeting the commit used to build the VSIX.
+4. Enter a release title and release notes.
+5. Upload the generated `.vsix` file under **Assets**.
+6. Review the tag, notes, and attached file, then choose **Publish release**.
+
+Keep the tag, extension version in `package.json`, and packaged VSIX version consistent. GitHub Releases publishing is currently a manual process; the `package:vsix` script only builds the package and does not upload it.
+
 ## Quick Start & Testing (Debug Mode)
 
 To quickly test the extension during development:
