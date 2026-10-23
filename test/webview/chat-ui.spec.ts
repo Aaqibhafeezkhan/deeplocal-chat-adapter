@@ -1,6 +1,10 @@
 import { test, expect, Page } from '@playwright/test';
 import { renderChatHtml } from '../../src/chat-webview';
 import { toolActivity } from '../../src/tool-activity';
+import { executeCommand } from '../../src/command-runner';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const reviewReport = {
   summary: 'Review completed.', label: 'HEAD~1..HEAD', testsRun: false, limitations: ['Only the selected changes were reviewed.'],
@@ -290,6 +294,62 @@ for (const theme of ['dark', 'light']) {
     await expect(page.locator('#historyButton')).toBeDisabled();
     await dispatch(page, { type: 'assistantDone', outcome: 'success' });
     await expect(selector).toBeEnabled();
+  });
+}
+
+for (const theme of ['dark', 'light'] as const) {
+  test(`failed command diagnostics are readable, bounded and safe in live/restored ${theme} activity`, async ({ page }, testInfo) => {
+    const directory = await mkdtemp(join(tmpdir(), 'browser-command-'));
+    try {
+      await writeFile(join(directory, 'diagnostics.txt'), 'src/main.ts:8:1 error no-unused-vars\nAPI_KEY=syntheticCredential78\n<img src=x onerror="window.synthetic78=true">\n' + 'context line\n'.repeat(2000) + 'final diagnostic tail\n');
+      const result = await executeCommand('node', ['-e', "const fs=require('fs');process.stdout.write(fs.readFileSync('diagnostics.txt'));process.stderr.write('stderr diagnostic\\n');process.exitCode=1"], directory);
+      expect(result).toMatchObject({ exitCode: 1, truncated: true, stderr: 'stderr diagnostic\n' });
+      // Public screenshots use a labelled synthetic workspace instead of the host temp path.
+      const visibleResult = { ...result, cwd: '/synthetic-workspace' };
+      const text = 'run_command\n' + JSON.stringify(visibleResult, null, 2);
+      const activity = { id: 'command-result-78', title: 'Run command', detail: 'node', state: 'error' };
+      await page.emulateMedia({ colorScheme: theme });
+      if (theme === 'light') await page.addStyleTag({ content: ':root { --vscode-foreground:#222; --vscode-sideBar-background:#f5f5f5; --vscode-descriptionForeground:#555; --vscode-editor-background:#fff; --vscode-panel-border:#ddd; --vscode-input-background:#fff; --vscode-input-foreground:#222; --vscode-dropdown-background:#fff; --vscode-input-border:#ccc; --vscode-textCodeBlock-background:#eee; --vscode-badge-background:#eee; --vscode-badge-foreground:#222; --vscode-errorForeground:#a1260d; }' });
+      for (const width of [260, 340, 480]) {
+        await page.setViewportSize({ width, height: 820 });
+        await dispatch(page, { type: 'restore', items: [] });
+        await dispatch(page, { type: 'toolStart', activity: { ...activity, state: 'running' } });
+        await dispatch(page, { type: 'toolResult', text, activity });
+        await expect(page.locator('.action-state')).toHaveText('Failed');
+        const summary = page.locator('.action summary');
+        await summary.focus(); await summary.press('Enter');
+        const output = page.locator('.action pre');
+        await expect(output).toContainText('src/main.ts:8:1 error no-unused-vars');
+        await expect(output).toContainText('stderr diagnostic');
+        await expect(output).toContainText('final diagnostic tail');
+        await expect(output).toContainText('truncated');
+        expect(await output.textContent()).not.toContain('syntheticCredential78');
+        expect(await page.evaluate(() => 'synthetic78' in window)).toBe(false);
+        await expect(page.locator('.action img, .action script')).toHaveCount(0);
+        for (const element of [output, page.locator('.action-state')]) {
+          const contrast = await element.evaluate(node => {
+            const style = getComputedStyle(node);
+            const luminance = (color: string) => {
+              const channels = color.match(/[\d.]+/g)!.slice(0, 3).map(value => {
+                const channel = Number(value) / 255;
+                return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+              });
+              return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+            };
+            const foreground = luminance(style.color), background = luminance(style.backgroundColor);
+            return (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
+          });
+          expect(contrast).toBeGreaterThanOrEqual(4.5);
+        }
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath(`command-result-${theme}-${width}.png`) });
+        await output.evaluate(node => { node.scrollTop = node.scrollHeight; });
+        await page.screenshot({ path: testInfo.outputPath(`command-result-tail-${theme}-${width}.png`) });
+        await dispatch(page, { type: 'restore', items: [{ role: 'Tool', text, activity }] });
+        await page.locator('.action summary').click();
+        await expect(page.locator('.action pre')).toHaveText(text.slice('run_command\n'.length));
+      }
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 }
 

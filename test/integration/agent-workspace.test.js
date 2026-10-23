@@ -15,7 +15,7 @@ async function assertSameDirectory(actual, expected) {
 // Exercise the actual source against VS Code's real filesystem, edits and URIs.
 buildSync({ entryPoints: [path.join(__dirname, '../../src/agent-tools.ts')], bundle: true,
   platform: 'node', format: 'cjs', external: ['vscode'], outfile: path.join(__dirname, '../../out/workspace-tools.cjs') });
-const { invokeAgentTool } = require('../../out/workspace-tools.cjs');
+const { invokeAgentTool, toolResultsToMessages } = require('../../out/workspace-tools.cjs');
 
 suite('Agent workspace selection with real files', () => {
   let temporary, roots, folders, originalCount;
@@ -84,7 +84,10 @@ suite('Agent workspace selection with real files', () => {
       const args = process.platform === 'win32' ? ['/d', '/c', 'cd'] : [];
       const result = await call('run_command', { command, args }, folder, options);
       assert.equal(result.status, 'success', result.content);
-      await assertSameDirectory(result.content.trim(), folder.uri.fsPath);
+      const commandResult = JSON.parse(result.content);
+      assert.equal(commandResult.exitCode, 0);
+      await assertSameDirectory(commandResult.cwd, folder.uri.fsPath);
+      await assertSameDirectory(commandResult.stdout.trim(), folder.uri.fsPath);
       assert.equal(await fs.readFile(path.join(folder.uri.fsPath, 'new.txt'), 'utf8'), `replaced-${index}`);
     }
     assert.equal(await fs.readFile(path.join(roots[0].fsPath, 'same.txt'), 'utf8'), 'changed-0');
@@ -97,7 +100,62 @@ suite('Agent workspace selection with real files', () => {
     } };
     const result = await invokeAgentTool('test', 'run_command', JSON.stringify({ command: process.platform === 'win32' ? 'cmd.exe' : 'pwd',
       args: process.platform === 'win32' ? ['/d', '/c', 'cd'] : [] }), options);
-    await assertSameDirectory(result.content.trim(), folders[1].uri.fsPath);
+    const commandResult = JSON.parse(result.content);
+    await assertSameDirectory(commandResult.cwd, folders[1].uri.fsPath);
+    await assertSameDirectory(commandResult.stdout.trim(), folders[1].uri.fsPath);
+  });
+
+  test('failed commands preserve separate diagnostics and actual exit codes for model tool messages', async () => {
+    for (const exitCode of [0, 1]) {
+      const result = await call('run_command', { command: 'node', args: ['-e', `process.stdout.write('src/main.ts:8 lint failure\\n');process.stderr.write('stderr detail\\n');process.exitCode=${exitCode}`] });
+      assert.equal(result.status, exitCode ? 'error' : 'success');
+      const value = JSON.parse(result.content);
+      assert.equal(value.exitCode, exitCode);
+      assert.equal(value.stdout, 'src/main.ts:8 lint failure\n');
+      assert.equal(value.stderr, 'stderr detail\n');
+      assert.equal(value.error, null);
+      await assertSameDirectory(value.cwd, folders[1].uri.fsPath);
+      assert.deepEqual(toolResultsToMessages([result]), [{ role: 'tool', tool_call_id: 'test', content: result.content }]);
+    }
+    const missing = await call('run_command', { command: 'missing-synthetic-command-78', args: [] });
+    assert.equal(missing.status, 'error');
+    assert.equal(JSON.parse(missing.content).error.code, 'ENOENT');
+    assert.equal(JSON.parse(missing.content).exitCode, null);
+  });
+
+  test('command cancellation retains partial output and denied/pre-cancelled commands never launch', async () => {
+    const controller = new AbortController();
+    const marker = path.join(folders[1].uri.fsPath, 'command-ready');
+    const pending = call('run_command', { command: 'node', args: ['-e', "require('fs').writeSync(1,'partial output\\n');require('fs').writeFileSync('command-ready','ready');setInterval(()=>{},1000)"] }, folders[1], { signal: controller.signal });
+    try {
+      const deadline = Date.now() + 5000;
+      while (true) {
+        try { await fs.access(marker); break; } catch {
+          assert.ok(Date.now() < deadline, 'command must start before cancellation');
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+      }
+    } finally { controller.abort(); }
+    const result = await pending;
+    assert.equal(result.status, 'error');
+    assert.equal(JSON.parse(result.content).stdout, 'partial output\n');
+    assert.equal(JSON.parse(result.content).cancelled, true);
+    const args = { command: 'node', args: ['-e', "require('fs').writeFileSync('unexpected-command','executed')"] };
+    const denied = await call('run_command', args, folders[1], { approvalMode: 'every', approve: async () => false });
+    assert.equal(denied.status, 'declined');
+    const cancelled = await call('run_command', args, folders[1], { signal: controller.signal });
+    assert.equal(JSON.parse(cancelled.content).cancelled, true);
+    await assert.rejects(fs.access(path.join(folders[1].uri.fsPath, 'unexpected-command')));
+  });
+
+  test('command output is redacted before model/display results while keeping lint errors useful', async () => {
+    const sentinel = 'syntheticCredential78';
+    await fs.writeFile(path.join(folders[1].uri.fsPath, 'synthetic-diagnostics.txt'), 'API_KEY=' + sentinel + '\nsrc/main.ts:8 lint failure\n');
+    const result = await call('run_command', { command: 'node', args: ['-e', "process.stdout.write(require('fs').readFileSync('synthetic-diagnostics.txt'));process.stderr.write('stderr failure');process.exitCode=1"] });
+    assert.doesNotMatch(result.content, new RegExp(sentinel));
+    assert.match(JSON.parse(result.content).stdout, /API_KEY=\[redacted\]/);
+    assert.match(JSON.parse(result.content).stdout, /src\/main.ts:8 lint failure/);
+    assert.equal(JSON.parse(result.content).stderr, 'stderr failure');
   });
 
   test('scopes listings, search, summaries and diagnostics to the selected root', async () => {

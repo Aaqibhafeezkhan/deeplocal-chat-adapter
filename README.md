@@ -276,6 +276,26 @@ history retain their existing behavior.
 `read_file` reads UTF-8 text. Files containing NUL bytes or invalid UTF-8 return
 an error identifying the workspace-relative path instead of their contents.
 
+`run_command` returns JSON for both successful and failed processes: command,
+arguments, selected working directory, exit code or signal, separate stdout and
+stderr, duration, timeout/cancellation/output-limit flags, and a truncation flag.
+Startup errors (such as a missing executable) have an `error` code and message.
+The same result reaches the model and the expandable tool activity, including
+partial output after a timeout or Stop. Existing approval rules still apply.
+
+Commands keep the two-minute deadline and one-MiB capture ceiling per stream.
+Exceeding a capture ceiling stops the child and explicitly marks incomplete
+output. Displayed results reserve space for both streams and retain their start
+and tail; each stream has a 10,000-character JSON-encoding budget. An incomplete
+line at a capture boundary is omitted before redaction. Recognized credential
+assignments/options, authorization/cookie headers, URL credentials, common token
+prefixes and private-key blocks are redacted before shortening or persistence.
+Sensitive argument lists are replaced as a whole. These are finite diagnostic
+rules, not a scanner for arbitrary unlabelled or encoded secrets. Approval prompts
+and original model-supplied arguments keep their existing behavior. Commands run
+without an implicit shell; the workspace directory is not an OS sandbox, and
+stopping a child does not provide process-tree isolation.
+
 TypeScript file edits (`.ts`, `.tsx`, `.mts`, and `.cts`, including declaration
 files) reject new or worsened duplicate import bindings before approval or saving.
 The agent should inspect existing imports and runtime usages and make targeted

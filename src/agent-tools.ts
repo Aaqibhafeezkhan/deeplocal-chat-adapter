@@ -1,15 +1,12 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import { ChatMessage, ChatTool } from './protocol';
 import { parseToolInput } from './tool-input';
 import { ApprovalMode } from './config';
 import { isInWorkspace, requireWorkspaceFolder, workspaceRelativePath } from './agent-workspace';
 import { findNewDuplicateImports, isTypeScriptPath } from './import-validation';
 import { beginEditValidation, EditValidation } from './edit-validation';
-
-const execFileAsync = promisify(execFile);
+import { executeCommand, commandSucceeded } from './command-runner';
 
 // Upper bounds for caller-supplied limits; defaults sit below these.
 const MAX_TEXT_CHARS = 60000;
@@ -186,7 +183,7 @@ export function getAgentTools(): ChatTool[] {
       type: 'function',
       function: {
         name: 'run_command',
-        description: 'Run a command in the workspace. Use mainly for tests, builds, and diagnostics. Permission behavior follows the selected approval mode.',
+        description: 'Run a command in the workspace. Returns JSON with separate stdout/stderr, exitCode or signal, durationMs, error and timeout/cancellation/output-limit/truncation flags, including on failure. Permission behavior follows the selected approval mode.',
         parameters: {
           type: 'object',
           required: ['command', 'args'],
@@ -203,7 +200,7 @@ export function getAgentTools(): ChatTool[] {
 export async function invokeAgentTool(callId: string, name: string, rawArguments: string, options: AgentToolOptions = {}): Promise<AgentToolResult> {
   let outcome: WorkspaceToolOutcome | undefined;
   try {
-    options.signal?.throwIfAborted();
+    if (name !== 'run_command') options.signal?.throwIfAborted();
     const args = parseToolInput(rawArguments);
     if (options.approvalMode === 'ask') {
       return result(callId, name, 'Ask-only mode does not permit agent operations. Explain the proposed action instead.', 'declined');
@@ -211,6 +208,9 @@ export async function invokeAgentTool(callId: string, name: string, rawArguments
     // Capture once, before any approval or other await.
     const folder = requireWorkspaceFolder(options.workspaceFolder);
     options = { ...options, workspaceFolder: folder };
+    // Commands retain their cancellation/partial-output result rather than
+    // losing it to the generic post-tool abort check. Validate launch below.
+    if (name === 'run_command') return await runCommand(callId, args, options);
     if (options.approvalMode === 'every' && !isActionTool(name)) {
       const approved = await approveIfNeeded(name, args, `Allow tool: ${name}`, options);
       options.signal?.throwIfAborted();
@@ -257,8 +257,6 @@ async function invokeWorkspaceTool(name: string, args: Record<string, unknown>, 
       return await deleteFile(args, options);
     case 'replace_in_file':
       return await replaceInFile(args, options);
-    case 'run_command':
-      return await runCommand(args, options);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -584,29 +582,26 @@ async function applyFileChange(uri: vscode.Uri, document: vscode.TextDocument | 
   }
 }
 
-async function runCommand(args: Record<string, unknown>, options: AgentToolOptions): Promise<string> {
+async function runCommand(callId: string, args: Record<string, unknown>, options: AgentToolOptions): Promise<AgentToolResult> {
   const command = String(args.command ?? '').trim();
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
   if (!command) {
     throw new Error('command is required.');
   }
 
+  const folder = requireWorkspaceFolder(options.workspaceFolder);
+  if (folder.uri.scheme !== 'file') throw new Error('Commands require a local workspace folder.');
+  if (options.signal?.aborted) return result(callId, 'run_command', JSON.stringify(await executeCommand(command, commandArgs, folder.uri.fsPath, options.signal)), 'error');
   const message = `Run command: ${command} ${commandArgs.join(' ')}?`;
   const ok = await approveIfNeeded('run_command', args, message, options);
   options.signal?.throwIfAborted();
   if (!ok) {
-    return 'User declined command execution.';
+    return result(callId, 'run_command', 'User declined command execution.');
   }
 
-  const folder = requireWorkspaceFolder(options.workspaceFolder);
-  if (folder.uri.scheme !== 'file') throw new Error('Commands require a local workspace folder.');
-  const { stdout, stderr } = await execFileAsync(command, commandArgs, {
-    cwd: folder.uri.fsPath,
-    timeout: 120000,
-    maxBuffer: 1024 * 1024,
-    signal: options.signal,
-  });
-  return truncate([stdout, stderr].filter(Boolean).join('\n'), 30000) || '(command completed with no output)';
+  requireWorkspaceFolder(folder);
+  const commandResult = await executeCommand(command, commandArgs, folder.uri.fsPath, options.signal);
+  return result(callId, 'run_command', JSON.stringify(commandResult, null, 2), commandSucceeded(commandResult) ? 'success' : 'error');
 }
 
 function result(callId: string, name: string, content: string, status: AgentToolResult['status'] = 'success'): AgentToolResult {
