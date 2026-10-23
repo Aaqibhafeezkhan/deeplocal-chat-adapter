@@ -6,6 +6,8 @@ import { ChatMessage, ChatTool } from './protocol';
 import { parseToolInput } from './tool-input';
 import { ApprovalMode } from './config';
 import { isInWorkspace, requireWorkspaceFolder, workspaceRelativePath } from './agent-workspace';
+import { findNewDuplicateImports, isTypeScriptPath } from './import-validation';
+import { beginEditValidation, EditValidation } from './edit-validation';
 
 const execFileAsync = promisify(execFile);
 
@@ -26,6 +28,14 @@ export interface AgentToolOptions {
   approve?: (message: string, preview?: () => Promise<void>) => Promise<boolean>;
   approvalMode?: ApprovalMode;
 }
+
+interface FileChangeOutcome {
+  content: string;
+  status: 'success' | 'error';
+  saved: true;
+}
+
+type WorkspaceToolOutcome = string | FileChangeOutcome;
 
 export function getAgentTools(): ChatTool[] {
   return [
@@ -191,6 +201,7 @@ export function getAgentTools(): ChatTool[] {
 }
 
 export async function invokeAgentTool(callId: string, name: string, rawArguments: string, options: AgentToolOptions = {}): Promise<AgentToolResult> {
+  let outcome: WorkspaceToolOutcome | undefined;
   try {
     options.signal?.throwIfAborted();
     const args = parseToolInput(rawArguments);
@@ -206,16 +217,21 @@ export async function invokeAgentTool(callId: string, name: string, rawArguments
       if (!approved) return result(callId, name, 'User declined tool execution. Do not retry without new instructions.', 'declined');
     }
     requireWorkspaceFolder(folder);
-    const content = await invokeWorkspaceTool(name, args, options, folder);
+    outcome = await invokeWorkspaceTool(name, args, options, folder);
     options.signal?.throwIfAborted();
     requireWorkspaceFolder(folder);
-    return result(callId, name, content);
+    return typeof outcome === 'string'
+      ? result(callId, name, outcome)
+      : result(callId, name, outcome.content, outcome.status);
   } catch (error) {
+    if (outcome && typeof outcome !== 'string' && outcome.saved) {
+      return result(callId, name, `${outcome.content}\nTask interrupted after saving: ${messageOf(error)}. The saved change remains; read the file before making further edits.`, 'error');
+    }
     return result(callId, name, `Tool error: ${messageOf(error)}`, 'error');
   }
 }
 
-async function invokeWorkspaceTool(name: string, args: Record<string, unknown>, options: AgentToolOptions, folder: vscode.WorkspaceFolder): Promise<string> {
+async function invokeWorkspaceTool(name: string, args: Record<string, unknown>, options: AgentToolOptions, folder: vscode.WorkspaceFolder): Promise<WorkspaceToolOutcome> {
   switch (name) {
     case 'get_workspace_summary':
       return await getWorkspaceSummary(folder);
@@ -445,7 +461,7 @@ async function searchWorkspace(args: Record<string, unknown>, folder: vscode.Wor
   return hits.join('\n') || '(no matches)';
 }
 
-async function writeFile(args: Record<string, unknown>, options: AgentToolOptions, createOnly = false): Promise<string> {
+async function writeFile(args: Record<string, unknown>, options: AgentToolOptions, createOnly = false): Promise<WorkspaceToolOutcome> {
   const folder = requireWorkspaceFolder(options.workspaceFolder);
   const uri = resolveWorkspacePath(args.path, folder);
   if (typeof args.content !== 'string') throw new Error('content must be a string.');
@@ -459,7 +475,7 @@ async function writeFile(args: Record<string, unknown>, options: AgentToolOption
   return applyFileChange(uri, document, args.content, options);
 }
 
-async function replaceInFile(args: Record<string, unknown>, options: AgentToolOptions): Promise<string> {
+async function replaceInFile(args: Record<string, unknown>, options: AgentToolOptions): Promise<WorkspaceToolOutcome> {
   const folder = requireWorkspaceFolder(options.workspaceFolder);
   const uri = resolveWorkspacePath(args.path, folder);
   const oldText = String(args.oldText ?? '');
@@ -510,18 +526,29 @@ async function deleteFile(args: Record<string, unknown>, options: AgentToolOptio
   }
 }
 
-async function applyFileChange(uri: vscode.Uri, document: vscode.TextDocument | undefined, content: string, options: AgentToolOptions): Promise<string> {
+async function applyFileChange(uri: vscode.Uri, document: vscode.TextDocument | undefined, content: string, options: AgentToolOptions): Promise<WorkspaceToolOutcome> {
   const folder = requireWorkspaceFolder(options.workspaceFolder);
   const label = workspaceRelativePath(uri, folder);
   if (document?.isDirty) throw new Error('File has unsaved changes. Save or discard them before requesting an agent edit.');
   const version = document?.version;
   const original = document?.getText() ?? '';
+  const typeScript = isTypeScriptPath(label);
+  if (typeScript) {
+    const conflicts = findNewDuplicateImports(label, original, content);
+    if (conflicts.length) {
+      const details = conflicts.slice(0, 80).map(conflict => `${conflict.name}: ${conflict.locations.map(location => `${label}:${location.line}:${location.character}`).join(', ')}`);
+      throw new Error(`No change applied: new or worsened duplicate import bindings.\n${truncate(details.join('\n'), 30000)}${conflicts.length > 80 ? '\n... additional conflicts omitted ...' : ''}\nRead the existing imports and symbol usages, then modify the existing declaration instead of adding a conflicting import.`);
+    }
+  }
   const scheme = `deeplocal-preview-${Math.random().toString(36).slice(2)}`;
   const before = vscode.Uri.parse(`${scheme}:/before/${encodeURIComponent(label)}`);
   const after = vscode.Uri.parse(`${scheme}:/after/${encodeURIComponent(label)}`);
   const provider = vscode.workspace.registerTextDocumentContentProvider(scheme, {
     provideTextDocumentContent: (target) => target.toString() === before.toString() ? original : content,
   });
+  let validation: EditValidation | undefined;
+  let savedMessage: string | undefined;
+  let report: Pick<FileChangeOutcome, 'content' | 'status'> | undefined;
   try {
     const preview = async () => { await vscode.commands.executeCommand('vscode.diff', before, after, `${document ? 'Edit' : 'Create'} ${label}`, { preview: true }); };
     const message = `${document ? 'Edit' : 'Create'} ${label} (${content.split('\n').length} lines)`;
@@ -538,12 +565,21 @@ async function applyFileChange(uri: vscode.Uri, document: vscode.TextDocument | 
     }
     options.signal?.throwIfAborted();
     requireWorkspaceFolder(options.workspaceFolder);
+    if (typeScript) validation = beginEditValidation(folder, uri, options.signal);
     if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code could not apply the file change.');
     const saved = await vscode.workspace.openTextDocument(uri);
     if (!await saved.save()) throw new Error('File change applied but could not be saved.');
-    await vscode.window.showTextDocument(saved, { preview: false, preserveFocus: true });
-    return `${document ? 'Updated' : 'Created'} ${label}.`;
+    savedMessage = `${document ? 'Updated' : 'Created'} ${label}.`;
+    report = await validation?.finish(saved);
+    if (!options.signal?.aborted) await vscode.window.showTextDocument(saved, { preview: false, preserveFocus: true });
+    return { content: `${savedMessage}${report ? `\n${report.content}` : ''}`, status: report?.status ?? 'success', saved: true };
+  } catch (error) {
+    if (savedMessage) {
+      return { content: `${savedMessage}\n${report?.content ?? 'Edit saved and retained.'}\n${report ? 'Editor display' : 'Verification or editor display'} did not finish: ${messageOf(error)}. Read the file and run relevant checks before claiming success.`, status: 'error', saved: true };
+    }
+    throw error;
   } finally {
+    validation?.dispose();
     provider.dispose();
   }
 }

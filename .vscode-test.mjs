@@ -12,7 +12,7 @@ writeFileSync(workspace, JSON.stringify({ folders: [{ path: 'anchor-one' }, { pa
 process.on('exit', () => rmSync(directory, { recursive: true, force: true }));
 
 export default defineConfig([
-  { label: 'single-folder', files: ['test/integration/extension.test.js', 'test/integration/review.test.js'], workspaceFolder: join(directory, 'anchor-one') },
+  { label: 'single-folder', files: ['test/integration/extension.test.js', 'test/integration/review.test.js', 'test/integration/edit-validation.test.js'], workspaceFolder: join(directory, 'anchor-one') },
   { label: 'multi-root', files: 'test/integration/agent-workspace.test.js', workspaceFolder: workspace },
 ].map(test => ({
   ...test,
