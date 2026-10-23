@@ -6,6 +6,8 @@ import * as vscode from 'vscode';
 import { invokeAgentTool } from '../../src/agent-tools';
 import { ChatCompletionRequest, ChatMessage, StreamEvent } from '../../src/protocol';
 import { toolActivity } from '../../src/tool-activity';
+import { mkdtemp, writeFile, rm, access } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 
 const env = vi.hoisted(() => ({
   files: new Map<string, string>(), dirty: false, version: 1,
@@ -379,6 +381,42 @@ it('updates session previews after follow-ups and preserves selection, titles an
   expect(harness.state.get('deeplocal.activeSessionId.folders:/project')).toBe(previous.activeSessionId);
   const stored = harness.state.get('deeplocal.sessions.folders:/project') as Array<Record<string, unknown>>;
   expect(stored.every(session => !('preview' in session))).toBe(true);
+});
+
+it.each([false, true])('preserves sanitized command results in activity, saved history and model continuation (cancel=%s)', async cancel => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'panel-command-'));
+  const sentinel = 'syntheticCredential78';
+  try {
+    env.folders = [{ name: 'commands', index: 0, uri: { fsPath: directory, scheme: 'file', toString: () => directory } } as vscode.WorkspaceFolder];
+    await writeFile(path.join(directory, 'diagnostics.txt'), 'src/main.ts:8 lint failure\nAPI_KEY=' + sentinel + '\n<img src=x onerror="synthetic78()">');
+    const code = "const fs=require('fs');fs.writeSync(1,fs.readFileSync('diagnostics.txt'));fs.writeSync(2,'stderr diagnostic\\n');fs.writeFileSync('ready','ready');" + (cancel ? 'setInterval(()=>{},1000)' : 'process.exitCode=1');
+    const event: StreamEvent = { kind: 'toolCall', value: { id: 'cmd78', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: process.execPath, args: ['-e', code] }) } } };
+    const harness = panelHarness([[event], [{ kind: 'text', value: 'The lint diagnostic identifies the failing line.' }]]);
+    harness.send({ type: 'send', model: 'test', text: 'Run the synthetic diagnostic' });
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'approval')).toBe(true));
+    const approval = harness.sent.find(message => message.type === 'approval')!;
+    harness.send({ type: 'approval', approvalId: approval.approvalId, approved: true });
+    if (cancel) {
+      await vi.waitFor(async () => { await access(path.join(directory, 'ready')); }, { timeout: 5000 });
+      harness.send({ type: 'stop' });
+    }
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'assistantDone')).toBe(true), { timeout: 5000 });
+    const tool = harness.sent.find(message => message.type === 'toolResult')!;
+    expect(tool.activity).toMatchObject({ title: 'Run command', state: cancel ? 'cancelled' : 'error' });
+    const result = JSON.parse((tool.text as string).slice('run_command\n'.length));
+    expect(result).toMatchObject({ exitCode: cancel ? null : 1, cancelled: cancel, stderr: 'stderr diagnostic\n' });
+    expect(result.stdout).toContain('src/main.ts:8 lint failure');
+    expect(result.stdout).toContain('[redacted]');
+    expect(JSON.stringify(harness.sent)).not.toContain(sentinel);
+    const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ id: string; history: ChatMessage[]; transcript: unknown[] }>;
+    expect(JSON.stringify(sessions)).not.toContain(sentinel);
+    expect(sessions[0].history.find(message => message.role === 'tool')?.content).toBe((tool.text as string).slice('run_command\n'.length));
+    if (!cancel) expect(harness.requests[1].messages.find(message => message.role === 'tool')?.content).toBe((tool.text as string).slice('run_command\n'.length));
+    harness.send({ type: 'switchSession', sessionId: sessions[0].id });
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'restore')).toBe(true));
+    expect(JSON.stringify(harness.sent.filter(message => message.type === 'restore'))).toContain('src/main.ts:8 lint failure');
+    expect(JSON.stringify(harness.sent.filter(message => message.type === 'restore'))).not.toContain(sentinel);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 function panelHarness(responses: StreamEvent[][], savedItems?: Array<Record<string, unknown>>, savedHistory: ChatMessage[] = []) {
