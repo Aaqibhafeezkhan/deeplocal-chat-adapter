@@ -276,6 +276,26 @@ history retain their existing behavior.
 `read_file` reads UTF-8 text. Files containing NUL bytes or invalid UTF-8 return
 an error identifying the workspace-relative path instead of their contents.
 
+TypeScript file edits (`.ts`, `.tsx`, `.mts`, and `.cts`, including declaration
+files) reject new or worsened duplicate import bindings before approval or saving.
+The agent should inspect existing imports and runtime usages and make targeted
+changes rather than adding equivalent imports.
+
+After an approved TypeScript edit is saved, the extension compares available VS
+Code diagnostics in the selected workspace. It reports newly observed, resolved,
+and remaining diagnostics, including errors in already diagnosed dependent files.
+New errors are returned to the agent for repair; the saved edit is retained.
+Existing approval modes and command permissions still apply. Builds, lint, and
+tests run only through the normal agent command flow.
+
+Diagnostic observation waits up to two seconds and is best effort: VS Code does
+not identify which document version a diagnostic update checked. Missing or
+unsettled updates, unavailable providers, and concurrent edits make verification
+inconclusive. An empty snapshot does not prove compilation succeeded. Diagnostics
+depend on the project's installed language/lint providers and configuration;
+closed files may not have diagnostics. Shell commands bypass the file-tool import
+guard. Use relevant project checks before considering a fix complete.
+
 Use **Stop** to cancel the active request or pending approval. Changes already
 applied before cancellation remain in place.
 

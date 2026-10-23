@@ -11,6 +11,9 @@ const env = vi.hoisted(() => ({
   files: new Map<string, string>(), dirty: false, version: 1,
   apply: vi.fn(), show: vi.fn(), dispose: vi.fn(), command: vi.fn(), trash: vi.fn(),
   clipboard: vi.fn(), picker: vi.fn(),
+  save: vi.fn(),
+  diagnostics: new Map<string, vscode.Diagnostic[]>(),
+  diagnosticListeners: new Set<(event: vscode.DiagnosticChangeEvent) => void>(),
   folders: [] as vscode.WorkspaceFolder[],
   foldersChanged: (_event: vscode.WorkspaceFoldersChangeEvent) => {},
   config: { injectSystemPrompt: true, agentMaxTurns: 3, maxOutputTokens: 1000, backend: 'local', approvalMode: 'every' },
@@ -34,9 +37,19 @@ vi.mock('vscode', () => {
       document: { fileName: '/project/existing.ts', uri: uri('/project/existing.ts'), getText: () => 'important original' },
     } },
     commands: { executeCommand: env.command },
+    DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
+    languages: {
+      getDiagnostics: (target?: { fsPath: string }) => target ? env.diagnostics.get(target.fsPath) ?? []
+        : [...env.diagnostics].map(([file, diagnostics]) => [uri(file), diagnostics]),
+      onDidChangeDiagnostics: (callback: (event: vscode.DiagnosticChangeEvent) => void) => {
+        env.diagnosticListeners.add(callback);
+        return { dispose: () => env.diagnosticListeners.delete(callback) };
+      },
+    },
     workspace: {
       get workspaceFolders() { return env.folders; },
       onDidChangeWorkspaceFolders: (callback: typeof env.foldersChanged) => { env.foldersChanged = callback; return { dispose: vi.fn() }; },
+      onDidChangeTextDocument: () => ({ dispose: vi.fn() }),
       asRelativePath: (target: { fsPath: string }) => path.relative('/project', target.fsPath),
       registerTextDocumentContentProvider: () => ({ dispose: env.dispose }),
       fs: { stat: async (target: { fsPath: string }) => {
@@ -49,7 +62,7 @@ vi.mock('vscode', () => {
       openTextDocument: async (target: { fsPath: string }) => ({
         uri: target, get isDirty() { return env.dirty; }, get version() { return env.version; },
         getText: () => env.files.get(target.fsPath) ?? '', positionAt: (offset: number) => offset,
-        save: async () => true,
+        save: async () => { env.save(target); return true; },
       }),
       applyEdit: async (edit: WorkspaceEdit) => {
         env.apply(edit);
@@ -67,6 +80,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   env.folders = [{ name: 'project', uri: { fsPath: '/project', scheme: 'file', toString: () => '/project' }, index: 0 } as vscode.WorkspaceFolder];
   env.files.clear();
+  env.diagnostics.clear();
+  env.diagnosticListeners.clear();
+  env.save.mockReset();
   env.files.set('/project/existing.ts', 'important original');
   env.dirty = false;
   env.version = 1;
@@ -75,6 +91,80 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 const createArgs = JSON.stringify({ path: 'snake.html', content: '<html>snake</html>' });
+
+function publishDiagnostics(file: string, diagnostics: vscode.Diagnostic[]) {
+  env.diagnostics.set(file, diagnostics);
+  const target = { fsPath: file, scheme: 'file', toString: () => file } as vscode.Uri;
+  for (const listener of env.diagnosticListeners) listener({ uris: [target] });
+}
+
+function diagnostic(message: string, severity: number, source: string, code: number): vscode.Diagnostic {
+  return { message, severity, source, code, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } } as vscode.Diagnostic;
+}
+
+it.each(['create_file', 'write_file', 'replace_in_file'])('blocks duplicate imports through %s before approval or writing', async name => {
+  const original = "import { SnakeRenderer } from './renderer';\nnew SnakeRenderer();";
+  const duplicate = "import type { SnakeRenderer } from './renderer';\n";
+  env.files.set('/project/existing.ts', original);
+  const args = name === 'replace_in_file' ? { path: 'existing.ts', oldText: 'new SnakeRenderer();', newText: duplicate + 'new SnakeRenderer();' }
+    : { path: name === 'create_file' ? 'new.ts' : 'existing.ts', content: duplicate + original };
+  const approve = vi.fn(async () => true);
+  const result = await invokeAgentTool('duplicate', name, JSON.stringify(args), { approve });
+  expect(result.status).toBe('error');
+  expect(result.content).toContain('No change applied');
+  expect(result.content).toContain('SnakeRenderer');
+  expect(env.files.get('/project/existing.ts')).toBe(original);
+  expect(env.files.has('/project/new.ts')).toBe(false);
+  expect(approve).not.toHaveBeenCalled();
+  expect(env.apply).not.toHaveBeenCalled();
+});
+
+it('retains saved edits and forwards new compilation errors to the model and persisted transcript', async () => {
+  env.diagnostics.set('/project/existing.ts', [diagnostic('Use a type import', 1, 'eslint', 1)]);
+  env.save.mockImplementation(() => publishDiagnostics('/project/existing.ts', [diagnostic('Class cannot be used as a value', 0, 'ts', 1361)]));
+  const editTool: StreamEvent = { kind: 'toolCall', value: {
+    id: 'edit-regression', type: 'function', function: { name: 'write_file', arguments: JSON.stringify({ path: 'existing.ts', content: 'export const changed = true;' }) },
+  } };
+  const harness = panelHarness([[editTool], [{ kind: 'text', value: 'The saved edit requires repair.' }]]);
+  harness.send({ type: 'send', text: 'Fix the lint warning', model: 'test' });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'approval')).toBe(true));
+  const approval = harness.sent.find(message => message.type === 'approval')!;
+  harness.send({ type: 'approval', approvalId: approval.approvalId, approved: true });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'assistantDone')).toBe(true), { timeout: 4000 });
+  const result = harness.requests[1].messages.find(message => message.role === 'tool')!;
+  expect(result.content).toContain('saved and retained');
+  expect(result.content).toContain('Class cannot be used as a value');
+  expect(harness.sent.find(message => message.type === 'toolResult')?.activity).toMatchObject({ state: 'error' });
+  const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ transcript: Array<{ role: string; text: string }> }>;
+  expect(sessions[0].transcript.find(item => item.role === 'Tool')?.text).toContain('Class cannot be used as a value');
+  expect(env.files.get('/project/existing.ts')).toBe('export const changed = true;');
+  expect(env.diagnosticListeners.size).toBe(0);
+});
+
+it('retains a saved TypeScript edit when cancellation interrupts diagnostic validation', async () => {
+  const controller = new AbortController();
+  env.save.mockImplementation(() => controller.abort());
+  const result = await invokeAgentTool('cancel-validation', 'write_file', JSON.stringify({ path: 'existing.ts', content: 'export const saved = true;' }),
+    { approvalMode: 'full', signal: controller.signal });
+  expect(result.content).toContain('saved and retained');
+  expect(result.status).toBe('error');
+  expect(env.files.get('/project/existing.ts')).toBe('export const saved = true;');
+  expect(env.diagnosticListeners.size).toBe(0);
+});
+
+it('preserves observed diagnostic errors when displaying the saved editor fails', async () => {
+  env.save.mockImplementation(() => publishDiagnostics('/project/existing.ts', [diagnostic('Runtime class requires a value import', 0, 'ts', 1361)]));
+  env.show.mockRejectedValueOnce(new Error('Editor unavailable'));
+  const content = 'export const saved = true;';
+  const result = await invokeAgentTool('display-failure', 'write_file', JSON.stringify({ path: 'existing.ts', content }),
+    { approvalMode: 'full' });
+  expect(result.status).toBe('error');
+  expect(result.content).toContain('saved and retained');
+  expect(result.content).toContain('Runtime class requires a value import');
+  expect(result.content).toContain('Editor unavailable');
+  expect(env.files.get('/project/existing.ts')).toBe(content);
+  expect(env.diagnosticListeners.size).toBe(0);
+});
 
 it('creates the requested file without touching the active file, with a reviewable diff', async () => {
   const approve = vi.fn(async (_message: string, preview?: () => Promise<void>) => {

@@ -30,7 +30,8 @@ suite('deeplocal-chat-adapter Extension Host', () => {
   });
 
   test('discovers and activates despite the unavailable default DeepLocal endpoint', async () => {
-    const extension = vscode.extensions.getExtension('local-dev.deeplocal-chat-adapter');
+    const { publisher, name } = require('../../package.json');
+    const extension = vscode.extensions.getExtension(`${publisher}.${name}`);
     assert.ok(extension, 'extension should be discovered by its manifest');
     await extension.activate();
     assert.equal(extension.isActive, true);
