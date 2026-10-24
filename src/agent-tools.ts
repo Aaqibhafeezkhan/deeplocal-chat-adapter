@@ -5,8 +5,8 @@ import { parseToolInput } from './tool-input';
 import { ApprovalMode } from './config';
 import { isInWorkspace, requireWorkspaceFolder, workspaceRelativePath } from './agent-workspace';
 import { findNewDuplicateImports, isTypeScriptPath } from './import-validation';
-import { beginEditValidation, EditValidation } from './edit-validation';
-import { executeCommand, commandSucceeded } from './command-runner';
+import { beginEditValidation, DiagnosticObservation, EditValidation } from './edit-validation';
+import { executeCommand, commandSucceeded, CommandResult } from './command-runner';
 
 // Upper bounds for caller-supplied limits; defaults sit below these.
 const MAX_TEXT_CHARS = 60000;
@@ -17,6 +17,8 @@ export interface AgentToolResult {
   name: string;
   content: string;
   status: 'success' | 'error' | 'declined';
+  command?: CommandResult;
+  edit?: { path: string; saved: true; diagnostics?: DiagnosticObservation };
 }
 
 export interface AgentToolOptions {
@@ -30,6 +32,7 @@ interface FileChangeOutcome {
   content: string;
   status: 'success' | 'error';
   saved: true;
+  edit: NonNullable<AgentToolResult['edit']>;
 }
 
 type WorkspaceToolOutcome = string | FileChangeOutcome;
@@ -222,10 +225,10 @@ export async function invokeAgentTool(callId: string, name: string, rawArguments
     requireWorkspaceFolder(folder);
     return typeof outcome === 'string'
       ? result(callId, name, outcome)
-      : result(callId, name, outcome.content, outcome.status);
+      : { ...result(callId, name, outcome.content, outcome.status), edit: outcome.edit };
   } catch (error) {
     if (outcome && typeof outcome !== 'string' && outcome.saved) {
-      return result(callId, name, `${outcome.content}\nTask interrupted after saving: ${messageOf(error)}. The saved change remains; read the file before making further edits.`, 'error');
+      return { ...result(callId, name, `${outcome.content}\nTask interrupted after saving: ${messageOf(error)}. The saved change remains; read the file before making further edits.`, 'error'), edit: outcome.edit };
     }
     return result(callId, name, `Tool error: ${messageOf(error)}`, 'error');
   }
@@ -546,7 +549,7 @@ async function applyFileChange(uri: vscode.Uri, document: vscode.TextDocument | 
   });
   let validation: EditValidation | undefined;
   let savedMessage: string | undefined;
-  let report: Pick<FileChangeOutcome, 'content' | 'status'> | undefined;
+  let report: Awaited<ReturnType<EditValidation['finish']>> | undefined;
   try {
     const preview = async () => { await vscode.commands.executeCommand('vscode.diff', before, after, `${document ? 'Edit' : 'Create'} ${label}`, { preview: true }); };
     const message = `${document ? 'Edit' : 'Create'} ${label} (${content.split('\n').length} lines)`;
@@ -570,10 +573,12 @@ async function applyFileChange(uri: vscode.Uri, document: vscode.TextDocument | 
     savedMessage = `${document ? 'Updated' : 'Created'} ${label}.`;
     report = await validation?.finish(saved);
     if (!options.signal?.aborted) await vscode.window.showTextDocument(saved, { preview: false, preserveFocus: true });
-    return { content: `${savedMessage}${report ? `\n${report.content}` : ''}`, status: report?.status ?? 'success', saved: true };
+    return { content: `${savedMessage}${report ? `\n${report.content}` : ''}`, status: report?.status ?? 'success', saved: true,
+      edit: { path: label, saved: true, diagnostics: report?.diagnostics } };
   } catch (error) {
     if (savedMessage) {
-      return { content: `${savedMessage}\n${report?.content ?? 'Edit saved and retained.'}\n${report ? 'Editor display' : 'Verification or editor display'} did not finish: ${messageOf(error)}. Read the file and run relevant checks before claiming success.`, status: 'error', saved: true };
+      return { content: `${savedMessage}\n${report?.content ?? 'Edit saved and retained.'}\n${report ? 'Editor display' : 'Verification or editor display'} did not finish: ${messageOf(error)}. Read the file and run relevant checks before claiming success.`, status: 'error', saved: true,
+        edit: { path: label, saved: true, diagnostics: report?.diagnostics } };
     }
     throw error;
   } finally {
@@ -591,7 +596,10 @@ async function runCommand(callId: string, args: Record<string, unknown>, options
 
   const folder = requireWorkspaceFolder(options.workspaceFolder);
   if (folder.uri.scheme !== 'file') throw new Error('Commands require a local workspace folder.');
-  if (options.signal?.aborted) return result(callId, 'run_command', JSON.stringify(await executeCommand(command, commandArgs, folder.uri.fsPath, options.signal)), 'error');
+  if (options.signal?.aborted) {
+    const stopped = await executeCommand(command, commandArgs, folder.uri.fsPath, options.signal);
+    return { ...result(callId, 'run_command', JSON.stringify(stopped), 'error'), command: stopped };
+  }
   const message = `Run command: ${command} ${commandArgs.join(' ')}?`;
   const ok = await approveIfNeeded('run_command', args, message, options);
   options.signal?.throwIfAborted();
@@ -601,7 +609,7 @@ async function runCommand(callId: string, args: Record<string, unknown>, options
 
   requireWorkspaceFolder(folder);
   const commandResult = await executeCommand(command, commandArgs, folder.uri.fsPath, options.signal);
-  return result(callId, 'run_command', JSON.stringify(commandResult, null, 2), commandSucceeded(commandResult) ? 'success' : 'error');
+  return { ...result(callId, 'run_command', JSON.stringify(commandResult, null, 2), commandSucceeded(commandResult) ? 'success' : 'error'), command: commandResult };
 }
 
 function result(callId: string, name: string, content: string, status: AgentToolResult['status'] = 'success'): AgentToolResult {

@@ -70,6 +70,64 @@ suite('deeplocal-chat-adapter Extension Host', () => {
     assert.equal(result.content, 'automatic single folder');
   });
 
+  test('completion reports bind failed real commands and unexecuted builds to saved host evidence', async () => {
+    buildSync({ entryPoints: [path.join(__dirname, '../../src/chat-panel.ts')], bundle: true,
+      platform: 'node', format: 'cjs', external: ['vscode'], outfile: path.join(__dirname, '../../out/completion-panel.cjs') });
+    const { ChatPanel } = require('../../out/completion-panel.cjs');
+    const config = vscode.workspace.getConfiguration('deeplocal');
+    const oldMode = config.inspect('approvalMode')?.globalValue;
+    const values = new Map(), posts = [], requests = [], subscriptions = [];
+    const memento = { get: (key, fallback) => values.get(key) ?? fallback,
+      update: async (key, value) => { values.set(key, structuredClone(value)); } };
+    const code = "process.stdout.write('src/main.ts:8 lint failure\\n');process.stderr.write('synthetic diagnostic');process.exitCode=1";
+    const tool = (id, name, args) => ({ kind: 'toolCall', value: { id, type: 'function', function: { name, arguments: JSON.stringify(args) } } });
+    const responses = [
+      [tool('lint82', 'run_command', { command: 'node', args: ['-e', code] })],
+      [tool('completion82', 'submit_completion', { checks: [{ command: 'node', args: ['-e', code] }, { command: 'npm', args: ['run', 'build'] }], nextSteps: '请先修复错误，再运行构建。' })],
+      [{ kind: 'text', value: 'All fixed and verified.' }],
+    ];
+    const client = { modelInformation: () => ({ toolCalling: true }), cancel() {},
+      streamChat: async function* (_id, request) { requests.push(structuredClone(request)); yield* responses.shift() ?? []; } };
+    let receive, dispose;
+    const panel = new ChatPanel({ subscriptions, workspaceState: memento, globalState: memento }, client,
+      { error() {} }, { get: async () => '', set: async () => {}, clear: async () => {} });
+    try {
+      await config.update('approvalMode', 'full', vscode.ConfigurationTarget.Global);
+      panel.resolveWebviewView({ onDidDispose: callback => { dispose = callback; }, webview: {
+        cspSource: 'vscode-webview:', onDidReceiveMessage: callback => { receive = callback; },
+        postMessage: message => { posts.push(message); return Promise.resolve(true); },
+      } });
+      const waitDone = async count => {
+        const deadline = Date.now() + 10000;
+        while (posts.filter(message => message.type === 'assistantDone').length < count) {
+          assert.ok(Date.now() < deadline, 'completion must finish'); await new Promise(resolve => setTimeout(resolve, 20));
+        }
+      };
+      receive({ type: 'send', text: 'Run lint and build; 请用中文回答。', model: 'synthetic' }); await waitDone(1);
+      const final = posts.find(message => message.type === 'assistantFinal');
+      const report = JSON.parse(final.text);
+      assert.equal(report.verification, 'failed');
+      assert.deepEqual(report.checks.map(check => check.state), ['failed', 'not_run']);
+      assert.equal(report.attempts[0].exitCode, 1); assert.match(report.attempts[0].detail, /src\/main.ts:8/);
+      assert.equal(report.unverifiedModelText.nextSteps, '请先修复错误，再运行构建。');
+      assert.equal(report.unverifiedModelText.source, 'model'); assert.equal(report.unverifiedModelText.verified, false);
+      const sessions = [...values.values()].find(Array.isArray);
+      assert.deepEqual(sessions[0].transcript.at(-1).completionReport, report);
+      assert.equal(sessions[0].history.at(-1).content, final.text);
+      assert.ok(requests[1].messages.some(message => message.role === 'tool' && message.content.includes('synthetic diagnostic')));
+      receive({ type: 'switchSession', sessionId: sessions[0].id });
+      const deadline = Date.now() + 3000;
+      while (!posts.some(message => message.type === 'restore')) { assert.ok(Date.now() < deadline); await new Promise(resolve => setTimeout(resolve, 20)); }
+      assert.deepEqual(posts.find(message => message.type === 'restore').items.at(-1).completionReport, report);
+      receive({ type: 'send', text: 'Explain the next step only', model: 'synthetic' }); await waitDone(2);
+      const next = posts.filter(message => message.type === 'assistantFinal').at(-1).completionReport;
+      assert.equal(next.verification, 'unverified'); assert.deepEqual(next.attempts, []);
+    } finally {
+      dispose?.(); for (const subscription of subscriptions) subscription.dispose();
+      await config.update('approvalMode', oldMode, vscode.ConfigurationTarget.Global);
+    }
+  });
+
   test('restores the latest request preview and selection without adding persisted fields', async () => {
     buildSync({ entryPoints: [path.join(__dirname, '../../src/chat-panel.ts')], bundle: true,
       platform: 'node', format: 'cjs', external: ['vscode'], outfile: path.join(__dirname, '../../out/session-preview-panel.cjs') });

@@ -85,6 +85,9 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   .review-finding { border-left: 2px solid var(--vscode-panel-border, #ffffff30); margin: 10px 0; padding-left: 9px; }
   .review-finding p, .review-summary { white-space: pre-wrap; }
   .review-report ul { padding-left: 20px; }
+  .completion-report { overflow-wrap: anywhere; }
+  .completion-report ul { padding-left: 20px; }
+  .completion-report summary { cursor: pointer; }
   .shell[data-busy="true"] .status-dot { background: var(--vscode-progressBar-background, #0078d4); animation: pulse 1.2s infinite alternate; }
   @keyframes pulse { to { opacity: .35; } }
   @media (prefers-reduced-motion: reduce) { .status-dot { animation: none !important; } }
@@ -185,7 +188,7 @@ export function renderChatHtml(webview: { cspSource: string }): string {
   let copyRequestId = 0;
   let busy = false, activeSessionId, canSelectWorkspace = false;
   let workflow = 'normal', workflowPending = false, activeReview = false;
-  let currentAssistant, currentReasoning, assistantText = '', reasoningText = '', approvalId, failed = false;
+  let currentAssistant, currentReasoning, currentCompletion, assistantText = '', reasoningText = '', approvalId, failed = false;
   let selectedModel = saved.model || '', selectedBackend = saved.backend, approvalMode = saved.approvalMode || 'safe';
   let scheduledRender;
   const welcome = byId('welcome');
@@ -257,7 +260,7 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       }
     });
   }
-  function addCopy(body, reportId) {
+  function addCopy(body, reportId, canonicalText) {
     const controls = document.createElement('div'); controls.className = 'message-actions';
     const button = document.createElement('button'); button.type = 'button'; button.className = 'icon'; button.title = 'Copy';
     const copyTitle = 'Copy';
@@ -280,7 +283,7 @@ export function renderChatHtml(webview: { cspSource: string }): string {
         feedbackTimer = setTimeout(() => { feedback.textContent = ''; path.setAttribute('d', copyPath); button.title = copyTitle; }, 2000);
       });
       // Include folded content, excluding the role, code summaries and controls.
-      const text = [...body.querySelectorAll('.prose, pre')].map(node => node.textContent).join('');
+      const text = canonicalText ?? [...body.querySelectorAll('.prose, pre')].map(node => node.textContent).join('');
       vscode.postMessage(reportId ? { type: 'copyReview', requestId, reportId } : { type: 'copy', requestId, text });
     });
     controls.append(button, feedback); body.parentElement.append(controls);
@@ -291,6 +294,32 @@ export function renderChatHtml(webview: { cspSource: string }): string {
     const label = document.createElement('div'); label.className = 'role'; label.textContent = role;
     const body = document.createElement('div'); renderBody(body, text);
     item.append(label, body); messages.append(item); follow(followTail); return body;
+  }
+  function renderCompletion(body, report, text) {
+    body.replaceChildren(); body.className = 'completion-report';
+    const title = document.createElement('p'); title.className = 'completion-status';
+    title.textContent = 'Verification: ' + report.verification;
+    const scope = document.createElement('p'); scope.textContent = report.scope;
+    const missing = document.createElement('p'); missing.textContent = report.notRecorded;
+    const checks = document.createElement('ul'); checks.setAttribute('aria-label', 'Declared checks');
+    for (const check of report.checks) {
+      const row = document.createElement('li'); row.textContent = check.command + ' — ' + check.state; checks.append(row);
+    }
+    if (!report.checks.length) { const row = document.createElement('li'); row.textContent = 'No verification checks declared; verification not established.'; checks.append(row); }
+    const detail = document.createElement('details'), label = document.createElement('summary'), pre = document.createElement('pre');
+    label.textContent = 'All tool attempts and evidence (' + report.attempts.length + ')'; pre.textContent = text; detail.append(label, pre);
+    body.append(title, scope, checks, missing);
+    if (report.limitation) { const limitation = document.createElement('p'); limitation.textContent = report.limitation; body.append(limitation); }
+    body.append(detail);
+    const modelText = report.unverifiedModelText;
+    if (modelText && (modelText.nextSteps || modelText.checkReasons.length)) {
+      const notes = document.createElement('details'); notes.className = 'model-suggestions';
+      const heading = document.createElement('summary'); heading.textContent = 'Unverified model suggestions — not completion evidence';
+      notes.append(heading);
+      if (modelText.nextSteps) { const next = document.createElement('p'); next.className = 'prose'; next.textContent = modelText.nextSteps; notes.append(next); }
+      for (const reason of modelText.checkReasons) { const row = document.createElement('p'); row.textContent = reason.command + ': ' + reason.text; notes.append(row); }
+      body.append(notes);
+    }
   }
   function addReview(id, report) {
     const tail = nearBottom();
@@ -443,7 +472,10 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       currentReasoning = undefined; reasoningText = ''; currentAssistant = undefined; assistantText = '';
       messages.replaceChildren(welcome); welcome.hidden = msg.items.length > 0; actions.clear(); summaries.clear();
       for (const item of msg.items) {
-        if (item.reviewReport) addReview(item.id, item.reviewReport);
+        if (item.completionReport) {
+          const body = addMessage('Agent', ''); renderCompletion(body, item.completionReport, item.text); addCopy(body, undefined, item.text);
+        }
+        else if (item.reviewReport) addReview(item.id, item.reviewReport);
         else if (item.role === 'Tool') addTool(item.text, item.activity);
         else if (item.role === 'Summary') addSummary(item.id || 'restored-' + summaries.size, item.text, false);
         else if (item.role === 'Reasoning') { currentReasoning = undefined; addReasoning(item.text); currentReasoning = undefined; }
@@ -473,7 +505,7 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       status.textContent = msg.approved ? 'Applying approved action…' : 'Action declined';
     }
     if (msg.type === 'assistantStart') {
-      failed = false; assistantText = ''; reasoningText = ''; currentReasoning = undefined; activeReview = msg.review === true;
+      failed = false; assistantText = ''; reasoningText = ''; currentReasoning = undefined; currentCompletion = undefined; activeReview = msg.review === true;
       currentAssistant = msg.agent ? undefined : addMessage('Agent', ''); setBusy(true); status.textContent = activeReview ? 'Reviewing changes…' : 'Thinking…';
     }
     if (msg.type === 'assistantDelta' && currentAssistant) {
@@ -505,7 +537,9 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       currentReasoning?.remove(); currentReasoning = undefined; reasoningText = '';
       if (!currentAssistant) currentAssistant = addMessage('Agent', '');
       if (currentAssistant) {
-        const tail = nearBottom(); assistantText = msg.text; renderBody(currentAssistant, assistantText);
+        const tail = nearBottom(); assistantText = msg.text; currentCompletion = msg.completionReport;
+        if (currentCompletion) renderCompletion(currentAssistant, currentCompletion, assistantText);
+        else renderBody(currentAssistant, assistantText);
         messages.append(currentAssistant.parentElement); follow(tail);
       }
     }
@@ -513,12 +547,14 @@ export function renderChatHtml(webview: { cspSource: string }): string {
       finishSummaries();
       if (scheduledRender) cancelAnimationFrame(scheduledRender); scheduledRender = undefined;
       if (reasoningText) addReasoning(reasoningText);
-      if (currentAssistant && assistantText) renderBody(currentAssistant, assistantText);
+      if (currentAssistant && assistantText && !currentCompletion) renderBody(currentAssistant, assistantText);
       if (currentAssistant && !assistantText.trim()) currentAssistant.parentElement.remove();
-      if (currentAssistant && assistantText.trim() && !failed && (!msg.outcome || msg.outcome === 'success')) addCopy(currentAssistant);
+      if (currentAssistant && assistantText.trim() && (currentCompletion || (!failed && (!msg.outcome || msg.outcome === 'success')))) addCopy(currentAssistant, undefined, currentCompletion ? assistantText : undefined);
       setBusy(false); currentAssistant = undefined; currentReasoning = undefined;
       const reviewed = activeReview || msg.review === true;
       status.textContent = msg.outcome === 'cancelled' ? (reviewed ? 'Review stopped' : 'Stopped · Applied changes kept') : failed || msg.outcome === 'error' ? 'Needs attention' : msg.outcome === 'success' ? (reviewed ? 'Review completed' : 'Task completed') : 'Ready';
+      if (currentCompletion) status.textContent = 'Verification: ' + currentCompletion.verification;
+      currentCompletion = undefined;
       activeReview = false;
       remember(); resizePrompt();
     }

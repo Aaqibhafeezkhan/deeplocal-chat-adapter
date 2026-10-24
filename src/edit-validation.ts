@@ -1,7 +1,12 @@
 import * as vscode from 'vscode';
 import { isInWorkspace, requireWorkspaceFolder, workspaceRelativePath } from './agent-workspace';
 
-type Outcome = { content: string; status: 'success' | 'error' };
+export interface DiagnosticObservation {
+  state: 'observed' | 'inconclusive';
+  newErrors: number | null;
+  remainingErrors: number | null;
+}
+type Outcome = { content: string; status: 'success' | 'error'; diagnostics: DiagnosticObservation };
 type Observation = { key: string; path: string; line: number; character: number; severity: number; message: string; source: string; code: string };
 type Snapshot = Map<string, Observation[]>;
 
@@ -47,6 +52,7 @@ function describe(before: Snapshot | undefined, after: Snapshot | undefined, rea
         'VS Code diagnostic events do not identify the document version; this is best-effort observation, not proof of successful compilation.',
       ].join('\n'),
       status: cancelled ? 'error' : 'success',
+      diagnostics: { state: 'inconclusive', newErrors: null, remainingErrors: null },
     };
   }
   const groups: Record<'new' | 'resolved' | 'remaining', Observation[]> = { new: [], resolved: [], remaining: [] };
@@ -82,7 +88,8 @@ function describe(before: Snapshot | undefined, after: Snapshot | undefined, rea
     displayed++;
   }
   if (displayed < details.length) lines.push(`Diagnostic details truncated: showing ${displayed} of ${details.length} entries (limits: ${maxEntries} entries / ${maxCharacters} characters). Counts above are complete.`);
-  return { content: lines.join('\n'), status: cancelled || count(groups.new, vscode.DiagnosticSeverity.Error) > 0 ? 'error' : 'success' };
+  return { content: lines.join('\n'), status: cancelled || count(groups.new, vscode.DiagnosticSeverity.Error) > 0 ? 'error' : 'success',
+    diagnostics: { state: reason ? 'inconclusive' : 'observed', newErrors: count(groups.new, vscode.DiagnosticSeverity.Error), remainingErrors: count(groups.remaining, vscode.DiagnosticSeverity.Error) } };
 }
 
 /** Observe before applying an edit; finish only after the document has been saved. */

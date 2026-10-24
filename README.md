@@ -296,6 +296,32 @@ and original model-supplied arguments keep their existing behavior. Commands run
 without an implicit shell; the workspace directory is not an OS sandbox, and
 stopping a child does not provide process-tree isolation.
 
+Agent tasks finish with `submit_completion`, listing the exact executable and
+arguments for requested verification commands, including checks not run. The host
+derives the displayed states from this task's recorded tools; it never accepts a
+model-supplied pass/fail value. An unstructured model answer becomes an unverified
+report, even if no tools ran. Chat and Ask-only responses keep ordinary prose.
+The report is copied, saved and restored with the same evidence.
+
+`checks_passed` covers only the declared commands, not all project problems.
+All tool attempts remain inspectable, including undeclared failures and earlier
+retries. A requested check absent from the attempts is not run; the extension does
+not infer a verification plan or automatically execute extra checks. Later file
+mutation attempts conservatively invalidate earlier checks. A saved edit or
+settled editor diagnostics alone never proves a successful build; commands may
+also change files, and external edits are outside this task-local observation.
+Truncated/incomplete results cannot certify a check. Stops, stream errors and
+turn-limit exhaustion retain a partial report without starting a repair loop.
+
+Progress and suggested next steps follow the user's conversational language;
+fixed report labels/state names currently use English, like the surrounding UI.
+Suggestions and model-stated reasons are unchecked text. They appear in a
+separate, initially collapsed disclosure labelled as unverified model suggestions,
+not completion evidence. Canonical copy and saved/restored history retain the
+same explicit model-source/unverified wrapper; this text never determines check
+states. Evidence uses the existing finite diagnostic redaction rules; it is not
+a scanner for arbitrary secrets.
+
 TypeScript file edits (`.ts`, `.tsx`, `.mts`, and `.cts`, including declaration
 files) reject new or worsened duplicate import bindings before approval or saving.
 The agent should inspect existing imports and runtime usages and make targeted

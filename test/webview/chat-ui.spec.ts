@@ -5,6 +5,7 @@ import { executeCommand } from '../../src/command-runner';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { TaskEvidence, formatCompletion } from '../../src/task-evidence';
 
 const reviewReport = {
   summary: 'Review completed.', label: 'HEAD~1..HEAD', testsRun: false, limitations: ['Only the selected changes were reviewed.'],
@@ -294,6 +295,126 @@ for (const theme of ['dark', 'light']) {
     await expect(page.locator('#historyButton')).toBeDisabled();
     await dispatch(page, { type: 'assistantDone', outcome: 'success' });
     await expect(selector).toBeEnabled();
+  });
+}
+
+for (const scenario of [
+  { name: 'failed English claim', code: "console.error('compile failed');process.exitCode=2", text: 'All fixed. The build passed and no errors remain.', state: 'failed' },
+  { name: 'zero-action German claim', code: undefined, text: 'Alles behoben. Build und Tests sind erfolgreich.', state: 'unverified' },
+]) {
+  test(`contradictory suggestions keep an unverified label in live/copy/restore: ${scenario.name}`, async ({ page }, testInfo) => {
+    const directory = await mkdtemp(join(tmpdir(), 'completion82-unverified-'));
+    try {
+      const evidence = new TaskEvidence(), args = scenario.code ? ['-e', scenario.code] : ['run', 'build'];
+      const executable = scenario.code ? 'node' : 'npm';
+      if (scenario.code) {
+        const command = await executeCommand(executable, args, directory);
+        evidence.record({ id: 'failed82', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: executable, args }) } },
+          { callId: 'failed82', name: 'run_command', status: 'error', content: 'Compilation failed', command });
+      }
+      const report = evidence.report(JSON.stringify({ checks: [{ command: executable, args, reason: scenario.text }], nextSteps: scenario.text }));
+      const text = formatCompletion(report);
+      await page.setViewportSize({ width: 260, height: 820 });
+      await dispatch(page, { type: 'restore', items: [] });
+      await dispatch(page, { type: 'assistantStart', agent: true });
+      await dispatch(page, { type: 'assistantFinal', text, completionReport: report });
+      await dispatch(page, { type: 'assistantDone', outcome: 'success' });
+      await expect(page.locator('.completion-status')).toHaveText('Verification: ' + scenario.state);
+      await expect(page.locator('.completion-report > .prose')).toHaveCount(0);
+      const notes = page.locator('.model-suggestions');
+      await expect(notes.locator('summary')).toHaveText('Unverified model suggestions — not completion evidence');
+      await expect(notes.locator('.prose')).not.toBeVisible();
+      await page.screenshot({ path: testInfo.outputPath(`unverified-${scenario.state}-collapsed.png`) });
+      await notes.locator('summary').focus(); await page.keyboard.press('Enter');
+      await expect(notes.locator('.prose')).toHaveText(scenario.text);
+      await expect(notes.locator('.prose')).toBeVisible();
+      await page.screenshot({ path: testInfo.outputPath(`unverified-${scenario.state}-expanded.png`) });
+      await page.getByRole('button', { name: 'Copy assistant message' }).click();
+      const copied = await page.evaluate(() => window.__messages.at(-1));
+      expect(copied).toMatchObject({ type: 'copy', text });
+      const copiedReport = JSON.parse(copied!.text as string);
+      expect(copiedReport).not.toHaveProperty('nextSteps');
+      expect(copiedReport.unverifiedModelText).toMatchObject({ source: 'model', verified: false,
+        notice: 'Suggestions and stated reasons are not completion evidence.', nextSteps: scenario.text });
+      await dispatch(page, { type: 'restore', items: [{ role: 'DeepLocal', text, completionReport: report }] });
+      await expect(notes.locator('.prose')).not.toBeVisible();
+      await expect(notes.locator('summary')).toContainText('Unverified model suggestions');
+      await notes.locator('summary').press('Enter');
+      await expect(notes.locator('.prose')).toHaveText(scenario.text);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+test('empty, interrupted and blocked completion reports preserve their limits', async ({ page }) => {
+  const evidence = new TaskEvidence();
+  const reports = [evidence.report(), evidence.report(undefined, 'Task stopped; no tools ran.'),
+    evidence.report(JSON.stringify({ checks: [{ command: 'npm', args: ['run', 'build'], notRun: 'blocked', reason: 'Approval unavailable' }], nextSteps: '' }))];
+  for (const report of reports) {
+    await dispatch(page, { type: 'restore', items: [{ role: 'DeepLocal', text: formatCompletion(report), completionReport: report }] });
+    await expect(page.locator('.completion-status')).toHaveText('Verification: ' + report.verification);
+    await expect(page.locator('.completion-report')).toContainText('task completeness is not established');
+    await expect(page.locator('.completion-report .prose')).toHaveCount(0);
+    await page.locator('.completion-report > details:not(.model-suggestions) > summary').focus();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.completion-report pre')).toContainText('"attempts": []');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  }
+});
+
+for (const theme of ['dark', 'light'] as const) {
+  test(`completion facts remain visible, copyable and safe in ${theme} live/restored reports`, async ({ page }, testInfo) => {
+    const directory = await mkdtemp(join(tmpdir(), 'completion82-browser-'));
+    try {
+      await writeFile(join(directory, 'fixture.txt'), 'src/main.ts:8 lint failure\nAPI_KEY=syntheticCredential82\n<img src=x onerror="window.synthetic82=true">');
+      const args = ['-e', "process.stdout.write(require('fs').readFileSync('fixture.txt'));process.exitCode=1"];
+      const command = await executeCommand('node', args, directory);
+      const evidence = new TaskEvidence();
+      evidence.record({ id: 'lint82', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'node', args }) } },
+        { callId: 'lint82', name: 'run_command', status: 'error', content: JSON.stringify({ ...command, cwd: '/synthetic-workspace' }), command });
+      const report = evidence.report(JSON.stringify({ checks: [{ command: 'node', args }, { command: 'npm', args: ['run', 'build'] }], nextSteps: 'Bitte zuerst den Fehler beheben. <img src=x onerror="window.synthetic82=true">' }));
+      const text = formatCompletion(report);
+      if (theme === 'light') await page.addStyleTag({ content: ':root { --vscode-foreground:#222; --vscode-sideBar-background:#f5f5f5; --vscode-descriptionForeground:#555; --vscode-textCodeBlock-background:#eee; --vscode-input-background:#fff; --vscode-input-foreground:#222; --vscode-dropdown-background:#fff; --vscode-input-border:#ccc; --vscode-panel-border:#ddd; --vscode-focusBorder:#005fb8; }' });
+      for (const width of [260, 340, 480]) {
+        await page.setViewportSize({ width, height: 820 });
+        await dispatch(page, { type: 'restore', items: [] });
+        await dispatch(page, { type: 'assistantStart', agent: true });
+        await dispatch(page, { type: 'assistantFinal', text, completionReport: report });
+        await dispatch(page, { type: 'assistantDone', outcome: 'success' });
+        await expect(page.locator('.completion-status')).toHaveText('Verification: failed');
+        await expect(page.getByRole('list', { name: 'Declared checks' })).toContainText('not_run');
+        await expect(page.locator('#status')).toHaveText('Verification: failed');
+        await expect(page.locator('.completion-report')).toContainText('task completeness is not established');
+        await expect(page.locator('.completion-report')).toContainText('Bitte zuerst den Fehler beheben.');
+        const summary = page.locator('.completion-report > details:not(.model-suggestions) > summary');
+        await summary.focus(); await summary.press('Enter');
+        await expect(page.locator('.completion-report pre')).toBeVisible();
+        await expect(page.locator('.completion-report pre')).toContainText('src/main.ts:8 lint failure');
+        expect(await page.locator('.completion-report').textContent()).not.toContain('syntheticCredential82');
+        await expect(page.locator('.completion-report img, .completion-report script')).toHaveCount(0);
+        expect(await page.evaluate(() => 'synthetic82' in window)).toBe(false);
+        const contrast = await page.locator('.completion-status').evaluate(node => {
+          const rgb = (color: string) => color.match(/[\d.]+/g)!.slice(0, 3).map(Number).map(value => value / 255).map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4).reduce((sum, value, i) => sum + value * [.2126, .7152, .0722][i], 0);
+          const foreground = rgb(getComputedStyle(node).color), background = rgb(getComputedStyle(document.body).backgroundColor);
+          return (Math.max(foreground, background) + .05) / (Math.min(foreground, background) + .05);
+        });
+        expect(contrast).toBeGreaterThanOrEqual(4.5);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath(`completion-${theme}-${width}.png`) });
+        const notes = page.locator('.model-suggestions');
+        await expect(notes).not.toHaveAttribute('open', '');
+        await expect(notes.locator('summary')).toHaveText('Unverified model suggestions — not completion evidence');
+        await expect(notes.locator('.prose')).not.toBeVisible();
+        await notes.locator('summary').focus(); await page.keyboard.press('Enter');
+        await expect(notes.locator('.prose')).toBeVisible();
+        const copy = page.getByRole('button', { name: 'Copy assistant message' });
+        await copy.focus(); await copy.press('Enter');
+        expect(await page.evaluate(() => window.__messages.at(-1))).toMatchObject({ type: 'copy', text });
+        await dispatch(page, { type: 'restore', items: [{ role: 'DeepLocal', text, completionReport: report }] });
+        await expect(page.locator('.completion-status')).toHaveText('Verification: failed');
+        await expect(page.getByRole('button', { name: 'Copy assistant message' })).toHaveCount(1);
+      }
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 }
 

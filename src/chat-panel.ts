@@ -11,6 +11,7 @@ import { createGitReview } from './review-git';
 import { runReview } from './review-runner';
 import { formatReviewReport } from './review-report';
 import { ReviewRequest, ReviewReport } from './review-types';
+import { completionTool, CompletionReport, formatCompletion, TaskEvidence } from './task-evidence';
 
 interface WebviewMessage {
   type: 'selectWorkspace' | 'ready' | 'send' | 'stop' | 'approval' | 'preview' | 'refreshModels' | 'newSession' | 'switchSession' | 'deleteSession' | 'setBackend' | 'setRemoteApiKey' | 'clearRemoteApiKey' | 'setApiMode' | 'setSummary' | 'setApprovalMode' | 'copy' | 'setWorkflow' | 'openReviewReference' | 'copyReview';
@@ -36,6 +37,7 @@ interface PersistedChatItem {
   text: string;
   activity?: ToolActivity;
   reviewReport?: ReviewReport;
+  completionReport?: CompletionReport;
 }
 
 interface ChatSession {
@@ -457,6 +459,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.postWorkspace();
     const userMessage = text;
     const assistantItem: PersistedChatItem = { role: 'DeepLocal', text: '' };
+    const evidence = new TaskEvidence();
     let finalContext: ResponseContext | undefined;
     const onContext = (context: ResponseContext) => { finalContext = context; };
     const summaries = new Map<string, PersistedChatItem>();
@@ -511,6 +514,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
             'Ask before destructive work; file write and command tools already require user confirmation.',
             'After creating a file, use open_file if appropriate. Check diagnostics or run relevant tests. Report whether verification actually ran.',
             'If a tool fails or is declined, respect that result and never claim that the action succeeded. Answer in the user’s language.',
+            'In Agent mode, finish with submit_completion, as the only tool call in that turn, even when no tools ran. List exact command/args for every requested or declared verification check, including any build/test not run. The host records all attempts and derives canonical states. Use nextSteps only for actionable suggestions in the user’s conversational language; no free-form success summary. A passed declared command does not prove that all project errors are fixed.',
           ].join('\n'),
         });
       }
@@ -527,7 +531,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       };
       controller.signal.throwIfAborted();
       answer = effectiveAgent
-        ? await this.runAgentRequest(requestId, model, messages, onDelta, controller.signal, session, assistantItem, onSummary, onContext, folder!)
+        ? await this.runAgentRequest(requestId, model, messages, onDelta, controller.signal, session, assistantItem, onSummary, folder!, evidence)
         : await this.runChatRequest(requestId, model, messages, onDelta, onSummary, onContext);
       controller.signal.throwIfAborted();
 
@@ -536,12 +540,23 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       // Keep the final summary after the actions in both live and restored views.
       session.transcript = session.transcript.filter((item) => item !== assistantItem);
       session.transcript.push(assistantItem);
-      this.post({ type: 'assistantFinal', text: answer });
+      this.post({ type: 'assistantFinal', text: answer, ...(assistantItem.completionReport ? { completionReport: assistantItem.completionReport } : {}) });
       session.updatedAt = Date.now();
       await this.persist();
       this.postSessions();
     } catch (error) {
       outcome = controller.signal.aborted ? 'cancelled' : 'error';
+      if (effectiveAgent) {
+        const report = evidence.report(undefined, controller.signal.aborted ? 'Task stopped; partial changes and attempted tool results are retained.' : messageOf(error));
+        assistantItem.completionReport = report;
+        assistantItem.text = formatCompletion(report);
+        session.transcript = session.transcript.filter(item => item !== assistantItem);
+        session.transcript.push(assistantItem);
+        session.history.push({ role: 'assistant', content: assistantItem.text });
+        this.post({ type: 'assistantFinal', text: assistantItem.text, completionReport: report });
+        await this.persist();
+        return;
+      }
       if (useAgent && assistantItem.text.trim()) {
         assistantItem.role = 'Reasoning';
         session.transcript = session.transcript.filter((item) => item !== assistantItem);
@@ -602,8 +617,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     session: ChatSession,
     assistantItem: PersistedChatItem,
     onSummary: (event: Extract<StreamEvent, { kind: 'summary' }>) => void,
-    onContext: (context: ResponseContext) => void,
     folder: vscode.WorkspaceFolder,
+    evidence: TaskEvidence,
   ): Promise<string> {
     const workingMessages = [...messages];
     let finalAnswer = '';
@@ -624,17 +639,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         messages: workingMessages,
         stream: true,
         max_tokens: getConfig().maxOutputTokens,
-        tools: getAgentTools(),
+        tools: [...getAgentTools(), completionTool()],
         tool_choice: 'auto',
       })) {
         if (event.kind === 'text') {
           answer += event.value;
-          onDelta(event.value);
-          // Tool-call text is a user-visible progress update, shown before the
-          // operation it describes instead of being mixed into the final reply.
-          this.post({ type: 'reasoningDelta', text: event.value });
         } else if (event.kind === 'toolCall') {
           toolCalls.push(event.value);
+          if (toolCalls.length > 32) throw new Error('Task tool-call limit reached; verification is incomplete.');
         } else if (event.kind === 'summary') {
           onSummary(event);
         } else if (event.kind === 'responseContext') {
@@ -643,13 +655,26 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       }
 
       if (!toolCalls.length) {
-        if (responseContext) onContext(responseContext);
-        finalAnswer = answer;
-        if (!finalAnswer.trim()) throw new Error('The model returned no answer or tool actions. Retry or choose another model.');
+        // An agent can hallucinate a passed build before its first tool, too.
+        // Chat/Ask keep prose; Agent completions require observed evidence.
+        if (!answer.trim()) throw new Error('The model returned no answer or tool actions. Retry or choose another model.');
+        assistantItem.completionReport = evidence.report();
+        finalAnswer = formatCompletion(assistantItem.completionReport);
         break;
       }
 
+      evidence.reserve(toolCalls);
+      const submission = toolCalls.find(call => call.function.name === 'submit_completion');
+      if (submission) {
+        if (toolCalls.length !== 1) throw new Error('submit_completion must be the only tool call in the final turn.');
+        assistantItem.completionReport = evidence.report(submission.function.arguments);
+        finalAnswer = formatCompletion(assistantItem.completionReport);
+        assistantItem.text = '';
+        break;
+      }
       if (answer.trim()) {
+        onDelta(answer);
+        this.post({ type: 'reasoningDelta', text: answer });
         session.transcript.push({ role: 'Reasoning', text: answer });
       }
       assistantItem.text = '';
@@ -664,7 +689,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       const results = [];
       for (const call of toolCalls) {
         if (signal.aborted) {
-          results.push({ callId: call.id, name: call.function.name, content: 'Task stopped; tool was not executed.', status: 'error' as const });
+          const skipped = { callId: call.id, name: call.function.name, content: 'Task stopped; tool was not executed.', status: 'error' as const };
+          results.push(skipped);
+          evidence.record(call, skipped, false);
           continue;
         }
         const activity = toolActivity(`${requestId}:${turn}:${call.id}`, call);
@@ -676,6 +703,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           approvalMode: getConfig().approvalMode ?? 'safe',
           approve: (message, preview) => this.requestApproval(message, signal, preview),
         });
+        evidence.record(call, result);
         results.push(result);
         activity.state = signal.aborted ? 'cancelled' : result.status;
         if (call.function.name === 'write_file' && result.status === 'success') {
