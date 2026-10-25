@@ -70,6 +70,16 @@ it('never starts denied or pre-aborted commands', async () => {
   await expect(access(join(directory, 'unexpected'))).rejects.toThrow();
 });
 
+it.each(['true', 1, null, []])('rejects nonboolean verification metadata before approval or execution (%j)', async verification => {
+  const approve = vi.fn(async () => true);
+  const result = await invokeAgentTool('invalid-verification', 'run_command', JSON.stringify({ command: process.execPath,
+    args: ['-e', "require('fs').writeFileSync('unexpected','executed')"], verification }), { approvalMode: 'every', approve });
+  expect(result.status).toBe('error');
+  expect(result.content).toContain('verification must be a boolean');
+  expect(approve).not.toHaveBeenCalled();
+  await expect(access(join(directory, 'unexpected'))).rejects.toThrow();
+});
+
 it('checks selected workspace identity again after approval and refuses remote cwd', async () => {
   const code = "require('fs').writeFileSync('unexpected','executed')";
   const removed = await call(code, { approvalMode: 'every', approve: async () => { env.folders = []; return true; } });

@@ -11,6 +11,7 @@ export interface DeepLocalConfig {
   enableToolCalling: boolean;
   injectSystemPrompt: boolean;
   agentMaxTurns: number;
+  agentMaxRepairIterations?: number;
   approvalMode?: ApprovalMode;
   logLevel: 'debug' | 'info' | 'warning' | 'error' | 'off';
 }
@@ -39,9 +40,16 @@ export function getConfig(remoteApiKey = ''): DeepLocalConfig {
     // A high guard prevents runaway tool loops while keeping normal tasks
     // effectively unbounded from a user's perspective.
     agentMaxTurns: Math.max(1, Math.min(1000, config.get<number>('agentMaxTurns', 100))),
+    agentMaxRepairIterations: normalizeRepairIterations(config.get<unknown>('agentMaxRepairIterations', 3)),
     approvalMode: config.get<ApprovalMode>('approvalMode', 'safe'),
     logLevel: config.get<DeepLocalConfig['logLevel']>('logLevel', 'info'),
   };
+}
+
+function normalizeRepairIterations(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.min(20, Math.floor(value)))
+    : 3;
 }
 
 function normalizeBaseUrl(value: string): string {

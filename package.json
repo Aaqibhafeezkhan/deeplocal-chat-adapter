@@ -124,6 +124,13 @@
           "maximum": 1000,
           "description": "Safety limit for tool-use turns in one DeepLocal agent request. The default is high enough that normal tasks do not stop because of this setting."
         },
+        "deeplocal.agentMaxRepairIterations": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Maximum repair cycles after failed or missing verification in an agent request. Set to 0 to disable automatic repair; verification evidence remains accurate. The overall agentMaxTurns limit still applies."
+        },
         "deeplocal.approvalMode": {
           "type": "string",
           "enum": ["every", "safe", "full", "ask"],

@@ -193,6 +193,7 @@ export function getAgentTools(): ChatTool[] {
           properties: {
             command: { type: 'string' },
             args: { type: 'array', items: { type: 'string' } },
+            verification: { type: 'boolean', description: 'Declare this exact command as a required verification check. Failed checks remain required until verified.' },
           },
         },
       },
@@ -588,6 +589,7 @@ async function applyFileChange(uri: vscode.Uri, document: vscode.TextDocument | 
 }
 
 async function runCommand(callId: string, args: Record<string, unknown>, options: AgentToolOptions): Promise<AgentToolResult> {
+  if (args.verification !== undefined && typeof args.verification !== 'boolean') throw new Error('verification must be a boolean.');
   const command = String(args.command ?? '').trim();
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
   if (!command) {

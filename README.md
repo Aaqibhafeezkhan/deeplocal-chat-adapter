@@ -306,12 +306,30 @@ The report is copied, saved and restored with the same evidence.
 `checks_passed` covers only the declared commands, not all project problems.
 All tool attempts remain inspectable, including undeclared failures and earlier
 retries. A requested check absent from the attempts is not run; the extension does
-not infer a verification plan or automatically execute extra checks. Later file
+not infer a verification plan from an undeclared command. Later file
 mutation attempts conservatively invalidate earlier checks. A saved edit or
 settled editor diagnostics alone never proves a successful build; commands may
 also change files, and external edits are outside this task-local observation.
 Truncated/incomplete results cannot certify a check. Stops, stream errors and
 turn-limit exhaustion retain a partial report without starting a repair loop.
+
+For coding tasks, the existing agent loop inspects project scripts and chooses
+relevant checks. Commands marked with `verification: true` supply verification
+metadata; the host derives their outcome from recorded command evidence. Failed
+lint and build checks remain independent, so a passing build cannot clear a lint
+failure. File edits make earlier verification stale and require fresh checks.
+
+After failed or missing verification, the agent can inspect the failure, repair
+the code and rerun the relevant checks. A repair cycle begins after failed or
+missing verification and ends at the next verification attempt or premature
+completion submission. Inspection and editing tool calls within a cycle remain
+bounded by `deeplocal.agentMaxTurns`. `deeplocal.agentMaxRepairIterations` defaults
+to `3` and accepts integers from `0` through `20`; `0` disables automatic repair
+while preserving accurate evidence. The overall turn limit still applies.
+Repair stops after two consecutive identical diagnostics; denied approvals are
+not retried automatically. Explanation-only requests do not trigger automatic
+checks. Passing recorded checks proves only those checks passed, not that the
+entire task is complete.
 
 Progress and suggested next steps follow the user's conversational language;
 fixed report labels/state names currently use English, like the surrounding UI.
@@ -438,6 +456,7 @@ return models successfully.
 | `deeplocal.enableToolCalling` | `true` | Fallback tool-calling capability when model metadata does not specify it. |
 | `deeplocal.injectSystemPrompt` | `true` | Adds the extension's compact coding-assistant prompt. |
 | `deeplocal.agentMaxTurns` | `100` | Agent tool-use safety limit, configurable from 1 through 1000. |
+| `deeplocal.agentMaxRepairIterations` | `3` | Maximum verification repair cycles, from 0 through 20; 0 disables automatic repair while retaining accurate evidence. |
 | `deeplocal.approvalMode` | `safe` | Default approval behavior for sidebar agent tasks. |
 | `deeplocal.logLevel` | `info` | Extension output logging level. |
 
