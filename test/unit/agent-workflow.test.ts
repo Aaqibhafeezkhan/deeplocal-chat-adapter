@@ -913,13 +913,15 @@ it('suppresses an identical failed command when no repair changed workspace stat
 });
 
 it('stops changing failures at the configured repair boundary', async () => {
-  const harness = await repairHarness([[verificationCall('first')], [repairEdit()], [verificationCall('second')]],
+  const harness = await repairHarness([[verificationCall('first')], [repairEdit()], [verificationCall('second')], [repairEdit('beyond-limit')]],
     [{ exitCode: 1, stderr: 'first error' }, { exitCode: 1, stderr: 'different error' }], 1);
   harness.send({ type: 'send', model: 'test', text: 'Repair lint.' });
   const report = await harness.done();
   expect(report.limitation).toContain('iteration limit (1)');
   expect(report.verification).toBe('failed');
-  expect(harness.requests).toHaveLength(3);
+  expect(harness.requests).toHaveLength(4);
+  expect(env.apply).toHaveBeenCalledOnce();
+  expect(report.attempts.at(-1)).toMatchObject({ id: 'beyond-limit', state: 'not_run' });
   env.config.approvalMode = 'every';
 });
 

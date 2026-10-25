@@ -129,7 +129,7 @@
           "default": 3,
           "minimum": 0,
           "maximum": 20,
-          "description": "Maximum repair cycles after failed or missing verification in an agent request. Set to 0 to disable automatic repair; verification evidence remains accurate. The overall agentMaxTurns limit still applies."
+          "description": "Maximum repair cycles after failed or missing verification in an agent request. Each cycle can include multiple edits and checks. Set to 0 to disable automatic repair; verification evidence remains accurate. The overall agentMaxTurns limit still applies."
         },
         "deeplocal.approvalMode": {
           "type": "string",

@@ -135,7 +135,7 @@ suite('deeplocal-chat-adapter Extension Host', () => {
     id, type: 'function', function: { name, arguments: JSON.stringify(args) },
   } });
 
-  async function repairPanel(responses, approvalMode = 'full') {
+  async function repairPanel(responses, approvalMode = 'full', repairLimit = 3) {
     buildSync({ entryPoints: [path.join(__dirname, '../../src/chat-panel.ts')], bundle: true,
       platform: 'node', format: 'cjs', external: ['vscode'], outfile: path.join(__dirname, '../../out/repair-panel.cjs') });
     delete require.cache[require.resolve('../../out/repair-panel.cjs')];
@@ -143,7 +143,7 @@ suite('deeplocal-chat-adapter Extension Host', () => {
     const config = vscode.workspace.getConfiguration('deeplocal');
     const previous = ['approvalMode', 'agentMaxRepairIterations'].map(key => [key, config.inspect(key)?.globalValue]);
     await config.update('approvalMode', approvalMode, vscode.ConfigurationTarget.Global);
-    await config.update('agentMaxRepairIterations', 3, vscode.ConfigurationTarget.Global);
+    await config.update('agentMaxRepairIterations', repairLimit, vscode.ConfigurationTarget.Global);
     const values = new Map(), posts = [], requests = [], subscriptions = [];
     const memento = { get: (key, fallback) => values.get(key) ?? fallback,
       update: async (key, value) => { values.set(key, structuredClone(value)); } };
@@ -210,6 +210,72 @@ suite('deeplocal-chat-adapter Extension Host', () => {
       assert.equal(harness.requests.length, 6);
     } finally { await harness.close(); await vscode.workspace.fs.delete(uri); }
   });
+
+  for (const repairLimit of [1, 3]) {
+    for (const firstCheck of ['lint', 'build']) {
+      for (const batched of [true, false]) {
+        const scenario = `limit${repairLimit}-${firstCheck}-first-${batched ? 'batch' : 'separate'}`;
+        test(`one repair budget covers the complete verification suite: ${scenario}`, async () => {
+          const file = `repair79-suite-${scenario}.txt`;
+          const uri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, file);
+          let harness;
+          try {
+            await vscode.workspace.fs.writeFile(uri, Buffer.from('bad-token\n'));
+            const commands = {
+              lint: { command: 'node', args: ['-e', `const text=require('fs').readFileSync(${JSON.stringify(file)},'utf8');if(text.includes('bad-token')){console.error('lint error: bad-token');process.exitCode=1}else{console.log('lint passed')}`], verification: true },
+              build: { command: 'node', args: ['-e', "console.log('build passed')"], verification: true },
+              test: { command: 'node', args: ['-e', "console.log('tests passed')"], verification: true },
+            };
+            const order = firstCheck === 'lint' ? ['lint', 'build', 'test'] : ['build', 'lint', 'test'];
+            const callId = (name, phase) => `${scenario}-${name}-${phase}`;
+            const checkTurns = phase => {
+              const calls = order.map(name => toolEvent(callId(name, phase), 'run_command', commands[name]));
+              return batched ? [calls] : calls.map(call => [call]);
+            };
+            const readId = `${scenario}-read`, editId = `${scenario}-edit`;
+            const responses = [
+              ...checkTurns('initial'),
+              [toolEvent(readId, 'read_file', { path: file })],
+              [toolEvent(editId, 'replace_in_file', { path: file, oldText: 'bad-token', newText: 'good-token' })],
+              ...checkTurns('recheck'),
+              [toolEvent(`${scenario}-submit`, 'submit_completion', {
+                checks: order.map(name => ({ command: commands[name].command, args: commands[name].args })), nextSteps: '',
+              })],
+            ];
+            const expectedRequests = responses.length;
+            harness = await repairPanel(responses, 'full', repairLimit);
+            harness.send({ type: 'send', text: 'Run lint, build and tests, fix the lint error, then rerun every check.', model: 'synthetic' });
+            await harness.waitFor(() => harness.posts.some(message => message.type === 'assistantDone'));
+            const final = harness.posts.find(message => message.type === 'assistantFinal');
+            assert.ok(final?.completionReport, 'the full suite must produce a completion report');
+            const report = final.completionReport;
+            assert.equal(report.verification, 'checks_passed', 'one actual repair must fit within the repair budget');
+            assert.equal(harness.requests.length, expectedRequests, 'host must reach all checks and the final submission');
+            assert.deepEqual(report.checks, order.map(name => ({
+              command: JSON.stringify([commands[name].command, ...commands[name].args]), state: 'passed',
+              attempts: [callId(name, 'initial'), callId(name, 'recheck')],
+            })));
+            assert.deepEqual(report.attempts.map(attempt => attempt.id), [
+              ...order.map(name => callId(name, 'initial')), readId, editId,
+              ...order.map(name => callId(name, 'recheck')),
+            ], 'every initial check and complete recheck suite must run around exactly one targeted repair');
+            const commandAttempts = report.attempts.filter(attempt => attempt.tool === 'run_command');
+            assert.deepEqual(commandAttempts.map(attempt => attempt.exitCode), [
+              ...order.map(name => name === 'lint' ? 1 : 0), 0, 0, 0,
+            ]);
+            const edits = report.attempts.filter(attempt => attempt.tool === 'replace_in_file');
+            assert.equal(edits.length, 1);
+            assert.equal(edits[0].saved, true);
+            assert.equal(Buffer.from(await vscode.workspace.fs.readFile(uri)).toString(), 'good-token\n');
+            assert.equal(harness.posts.filter(message => message.type === 'assistantFinal').length, 1);
+          } finally {
+            if (harness) await harness.close();
+            await vscode.workspace.fs.delete(uri);
+          }
+        });
+      }
+    }
+  }
 
   for (const action of ['deny', 'stop']) {
     test(`pending verification approval ${action} never starts the command or repairs`, async () => {

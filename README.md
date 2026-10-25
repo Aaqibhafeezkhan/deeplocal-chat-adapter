@@ -319,11 +319,14 @@ metadata; the host derives their outcome from recorded command evidence. Failed
 lint and build checks remain independent, so a passing build cannot clear a lint
 failure. File edits make earlier verification stale and require fresh checks.
 
-After failed or missing verification, the agent can inspect the failure, repair
-the code and rerun the relevant checks. A repair cycle begins after failed or
-missing verification and ends at the next verification attempt or premature
-completion submission. Inspection and editing tool calls within a cycle remain
-bounded by `deeplocal.agentMaxTurns`. `deeplocal.agentMaxRepairIterations` defaults
+After failed or missing verification, the agent can inspect the failure, make
+targeted repairs and rerun the relevant checks. A repair cycle can include
+multiple file edits and verification commands; lint, build and test commands do
+not each consume a separate cycle. A further repair edit after rechecking starts
+the next cycle. Premature completion submissions can prompt another repair;
+repeated premature completions also consume the allowance. Inspection and editing
+tool calls remain bounded by `deeplocal.agentMaxTurns`.
+`deeplocal.agentMaxRepairIterations` defaults
 to `3` and accepts integers from `0` through `20`; `0` disables automatic repair
 while preserving accurate evidence. The overall turn limit still applies.
 Repair stops after two consecutive identical diagnostics; denied approvals are

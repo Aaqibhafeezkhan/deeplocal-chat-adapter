@@ -4,6 +4,11 @@ import type { RepairState } from './task-evidence';
 export class AgentRepair {
   private iterations = 0;
   private active = false;
+  private generation = 0;
+  private baseline = 0;
+  private repaired = false;
+  private rechecked = false;
+  private prompted = false;
   private readonly seen = new Set<string>();
   private readonly failures = new Map<string, string>();
   private reason: string | undefined;
@@ -16,7 +21,8 @@ export class AgentRepair {
 
   observe(state: RepairState): void {
     if (this.reason || this.limit === 0) return;
-    let attempted = false;
+    this.generation = state.generation;
+    if (this.active && state.generation !== this.baseline) this.repaired = true;
     for (const check of state.checks) {
       if (check.blocked) {
         this.stop('Verification is blocked by a denied approval or unavailable command. No automatic retry was made.');
@@ -24,9 +30,9 @@ export class AgentRepair {
       }
       if (!check.attemptId || this.seen.has(check.attemptId)) continue;
       this.seen.add(check.attemptId);
-      attempted = true;
+      if (this.active && this.repaired && check.generation === state.generation) this.rechecked = true;
       if (check.state === 'passed') this.failures.delete(check.key);
-      else if (check.fingerprint) {
+      else if (check.fingerprint && ['failed', 'incomplete'].includes(check.state)) {
         if (this.failures.get(check.key) === check.fingerprint) {
           this.stop('Verification stopped after two identical failures with no observed diagnostic progress.');
           return;
@@ -34,21 +40,26 @@ export class AgentRepair {
         this.failures.set(check.key, check.fingerprint);
       }
     }
-    // A re-verification ends the active cycle; inspection and edits do not.
-    if (attempted) this.active = false;
-    if (this.needsRepair(state)) this.begin();
-    else this.active = false;
+    // One repair can need several checks, even when they arrive in separate
+    // turns. Results alone never consume another attempt.
+    if (!this.needsRepair(state, this.active)) this.active = false;
+    else if (!this.active && (state.diagnosticErrors || state.checks.some(check => ['failed', 'incomplete'].includes(check.state)))) this.begin();
   }
 
-  /** A premature completion ends a cycle just as another verification does. */
+  /** Enforce the next repair allowance before a write or its approval can run. */
+  beforeMutation(): string | undefined {
+    if (this.active && this.repaired && this.rechecked) this.next();
+    return this.reason;
+  }
+
+  /** Prompt once within an attempt; repeated premature completions are bounded. */
   completion(state: RepairState): string | undefined {
-    const wasActive = this.active;
-    const previousIteration = this.iterations;
     this.observe(state);
     if (this.reason || this.limit === 0 || !this.needsRepair(state, true)) return undefined;
-    if (wasActive && this.iterations === previousIteration) this.active = false;
-    this.begin();
+    if (this.active && (this.prompted || (this.repaired && this.rechecked))) this.next();
+    else this.begin();
     if (this.reason) return undefined;
+    this.prompted = true;
     return `Verification is unresolved. Repair cycle ${this.iterations}/${this.limit}: inspect the recorded command output and relevant files, make a targeted fix, then rerun the unresolved checks using run_command with verification:true. Inspect existing project scripts; do not invent commands. Passing lint does not resolve a failed build. If verification cannot run, explain the concrete blocker. Do not repeat a denied action or an identical failed command without a repair.`;
   }
 
@@ -65,5 +76,14 @@ export class AgentRepair {
     }
     this.iterations++;
     this.active = true;
+    this.baseline = this.generation;
+    this.repaired = false;
+    this.rechecked = false;
+    this.prompted = false;
+  }
+
+  private next(): void {
+    this.active = false;
+    this.begin();
   }
 }

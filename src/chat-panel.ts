@@ -732,7 +732,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         const activity = toolActivity(`${requestId}:${turn}:${call.id}`, call);
         this.post({ type: 'status', message: `${activity.title}${activity.detail ? ` · ${activity.detail}` : ''}` });
         this.post({ type: 'toolStart', activity });
-        const retryBlock = repair.stopped ?? evidence.commandRetryBlock(call);
+        const mutating = ['create_file', 'write_file', 'replace_in_file', 'delete_file'].includes(call.function.name);
+        const retryBlock = repair.stopped ?? evidence.commandRetryBlock(call) ?? (mutating ? repair.beforeMutation() : undefined);
         if (retryBlock) repair.stop(retryBlock);
         const result = retryBlock
           ? { callId: call.id, name: call.function.name, content: `${retryBlock} Tool was not executed.`, status: 'error' as const }
