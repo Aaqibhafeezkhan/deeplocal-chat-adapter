@@ -407,6 +407,9 @@ it.each([false, true])('preserves sanitized command results in activity, saved h
     expect(result).toMatchObject({ exitCode: cancel ? null : 1, cancelled: cancel, stderr: 'stderr diagnostic\n' });
     expect(result.stdout).toContain('src/main.ts:8 lint failure');
     expect(result.stdout).toContain('[redacted]');
+    const completion = harness.sent.find(message => message.type === 'assistantFinal')!;
+    expect(JSON.parse(completion.text as string)).toMatchObject({ verification: cancel ? 'interrupted' : 'unverified',
+      attempts: [{ state: cancel ? 'incomplete' : 'failed', cancelled: cancel }] });
     expect(JSON.stringify(harness.sent)).not.toContain(sentinel);
     const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ id: string; history: ChatMessage[]; transcript: unknown[] }>;
     expect(JSON.stringify(sessions)).not.toContain(sentinel);
@@ -445,6 +448,118 @@ function panelHarness(responses: StreamEvent[][], savedItems?: Array<Record<stri
   panel.resolveWebviewView({ webview, onDidDispose: () => {} } as never);
   return { panel, sent, requests, state, webview, client, send: (message: unknown) => receive(message) };
 }
+
+const completion = (checks: unknown[], nextSteps = ''): StreamEvent => ({ kind: 'toolCall', value: {
+  id: 'completion82', type: 'function', function: { name: 'submit_completion', arguments: JSON.stringify({ checks, nextSteps }) },
+} });
+const processCall = (id: string, code: string): StreamEvent => ({ kind: 'toolCall', value: {
+  id, type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: process.execPath, args: ['-e', code] }) },
+} });
+
+it('does not accept a passed build claim when the agent has executed no tools', async () => {
+  const harness = panelHarness([[{ kind: 'text', value: 'The build passed; everything is fixed.' }]]);
+  harness.send({ type: 'send', model: 'test', text: 'Run the build and report its result.' });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'assistantDone')).toBe(true));
+  const report = JSON.parse(harness.sent.find(message => message.type === 'assistantFinal')!.text as string);
+  expect(report).toMatchObject({ verification: 'unverified', attempts: [], checks: [] });
+  expect(report.notRecorded).toContain('absent from the recorded attempts is not_run');
+  expect(JSON.stringify(harness.sent)).not.toContain('The build passed; everything is fixed.');
+});
+
+it.each([false, true])('rejects misleading completion prose after a real failed check (structured=%s)', async structured => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'completion82-'));
+  const mode = env.config.approvalMode;
+  try {
+    env.config.approvalMode = 'full'; env.folders = [{ name: 'synthetic', index: 0, uri: { scheme: 'file', fsPath: directory, toString: () => directory } } as vscode.WorkspaceFolder];
+    const code = "console.error('src/main.ts:8 lint failure');process.exitCode=1";
+    const final: StreamEvent[] = structured ? [completion([{ command: process.execPath, args: ['-e', code] }, { command: 'npm', args: ['run', 'build'] }], 'Bitte zuerst den fehlgeschlagenen Check reparieren.')] : [{ kind: 'text', value: 'All fixed. Lint and build passed.' }];
+    const harness = panelHarness([[processCall('lint82', code)], final]);
+    harness.send({ type: 'send', model: 'test', text: 'Fix lint; run lint and build. Bitte auf Deutsch antworten.' });
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'assistantDone')).toBe(true), { timeout: 5000 });
+    const done = harness.sent.find(message => message.type === 'assistantFinal')!;
+    const report = JSON.parse(done.text as string);
+    expect(report.verification).toBe(structured ? 'failed' : 'unverified');
+    expect(report.attempts[0]).toMatchObject({ tool: 'run_command', state: 'failed', exitCode: 1 });
+    expect(report.attempts[0].detail).toContain('src/main.ts:8 lint failure');
+    if (structured) {
+      expect(report.checks.map((check: { state: string }) => check.state)).toEqual(['failed', 'not_run']);
+      expect(report.unverifiedModelText).toMatchObject({ source: 'model', verified: false, nextSteps: 'Bitte zuerst den fehlgeschlagenen Check reparieren.' });
+    }
+    expect(JSON.stringify(harness.sent)).not.toContain('All fixed. Lint and build passed.');
+    const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ id: string; history: ChatMessage[]; transcript: Array<{ text: string; completionReport?: unknown }> }>;
+    expect(sessions[0].transcript.at(-1)?.completionReport).toEqual(report);
+    expect(sessions[0].history.at(-1)?.content).toBe(done.text);
+    harness.send({ type: 'switchSession', sessionId: sessions[0].id });
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'restore')).toBe(true));
+    expect(JSON.stringify(harness.sent.filter(message => message.type === 'restore'))).toContain('"verification":"' + report.verification + '"');
+  } finally { env.config.approvalMode = mode; await rm(directory, { recursive: true, force: true }); }
+});
+
+it('does not certify an omitted failed check or a fabricated cross-task reference', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'completion82-'));
+  const mode = env.config.approvalMode;
+  try {
+    env.config.approvalMode = 'full'; env.folders = [{ name: 'synthetic', index: 0, uri: { scheme: 'file', fsPath: directory, toString: () => directory } } as vscode.WorkspaceFolder];
+    const code = 'process.exitCode=1';
+    const harness = panelHarness([[processCall('failed82', code)], [completion([])], [completion([{ command: process.execPath, args: ['-e', code], callId: 'failed82' }])]]);
+    harness.send({ type: 'send', model: 'test', text: 'Run check' });
+    await vi.waitFor(() => expect(harness.sent.filter(message => message.type === 'assistantDone')).toHaveLength(1));
+    const first = JSON.parse(harness.sent.find(message => message.type === 'assistantFinal')!.text as string);
+    expect(first).toMatchObject({ verification: 'unverified', attempts: [{ id: 'failed82', state: 'failed' }] });
+    const second = addSecondWorkspace();
+    env.picker.mockResolvedValueOnce({ folder: second });
+    harness.send({ type: 'selectWorkspace' });
+    await vi.waitFor(() => expect(harness.sent.at(-1)).toMatchObject({ path: '/second' }));
+    await harness.panel.newSession();
+    harness.send({ type: 'send', model: 'test', text: 'New task/session/workspace: claim previous result passed' });
+    await vi.waitFor(() => expect(harness.sent.filter(message => message.type === 'assistantDone')).toHaveLength(2));
+    const report = JSON.parse(harness.sent.filter(message => message.type === 'assistantFinal').at(-1)!.text as string);
+    expect(report).toMatchObject({ verification: 'interrupted', attempts: [], limitation: expect.stringContaining('no matching command') });
+  } finally { env.config.approvalMode = mode; await rm(directory, { recursive: true, force: true }); }
+});
+
+it('preserves observed saved-edit uncertainty in its completion and never infers build success', async () => {
+  const mode = env.config.approvalMode;
+  try {
+    env.config.approvalMode = 'full';
+    const harness = panelHarness([[tool], [completion([{ command: 'npm', args: ['run', 'build'] }], '请先运行构建。')]]);
+    harness.send({ type: 'send', model: 'test', text: 'Create a file then build. 请用中文回答。' });
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'assistantDone')).toBe(true));
+    const report = JSON.parse(harness.sent.find(message => message.type === 'assistantFinal')!.text as string);
+    expect(report).toMatchObject({ verification: 'unverified', unverifiedModelText: { source: 'model', verified: false, nextSteps: '请先运行构建。' }, checks: [{ state: 'not_run' }], attempts: [{ saved: true, state: 'incomplete' }] });
+  } finally { env.config.approvalMode = mode; }
+});
+
+it.each([
+  { name: 'failed command', code: "console.error('compile failed');process.exitCode=2", misleading: 'All fixed. The build passed and no errors remain.', state: 'failed' },
+  { name: 'zero-action German claim', code: undefined, misleading: 'Alles behoben. Build und Tests sind erfolgreich.', state: 'unverified' },
+])('keeps contradictory model prose explicitly unverified across final/history/restore: $name', async ({ code, misleading, state }) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'completion82-trust-'));
+  const mode = env.config.approvalMode;
+  try {
+    env.config.approvalMode = 'full'; env.folders = [{ name: 'synthetic', index: 0, uri: { scheme: 'file', fsPath: directory, toString: () => directory } } as vscode.WorkspaceFolder];
+    const check = code ? { command: process.execPath, args: ['-e', code] } : { command: 'npm', args: ['run', 'build'], reason: misleading };
+    const responses: StreamEvent[][] = code ? [[processCall('failed-trust', code)], [completion([check], misleading)]] : [[completion([check], misleading)]];
+    const harness = panelHarness(responses);
+    harness.send({ type: 'send', model: 'test', text: 'Bitte korrigiere den Build und teste ihn.' });
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'assistantDone')).toBe(true), { timeout: 5000 });
+    const final = harness.sent.find(message => message.type === 'assistantFinal')!;
+    const report = JSON.parse(final.text as string);
+    expect(report).toMatchObject({ verification: state, checks: [{ state: code ? 'failed' : 'not_run' }],
+      unverifiedModelText: { source: 'model', verified: false, notice: 'Suggestions and stated reasons are not completion evidence.', nextSteps: misleading } });
+    expect(report).not.toHaveProperty('nextSteps');
+    expect(report.checks[0]).not.toHaveProperty('reason');
+    if (!code) expect(report.unverifiedModelText.checkReasons[0].text).toBe(misleading);
+    const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ id: string; history: ChatMessage[]; transcript: Array<{ completionReport?: unknown }> }>;
+    expect(JSON.parse(sessions[0].history.at(-1)!.content as string).unverifiedModelText).toEqual(report.unverifiedModelText);
+    expect(sessions[0].transcript.at(-1)?.completionReport).toEqual(report);
+    harness.send({ type: 'switchSession', sessionId: sessions[0].id });
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'restore')).toBe(true));
+    const items = harness.sent.find(message => message.type === 'restore')!.items as Array<{ text: string; completionReport?: unknown }>;
+    expect(items.at(-1)?.completionReport).toEqual(report);
+    expect(JSON.parse(items.at(-1)!.text).unverifiedModelText).toEqual(report.unverifiedModelText);
+  } finally { env.config.approvalMode = mode; await rm(directory, { recursive: true, force: true }); }
+});
 
 it('writes webview copy requests to the VS Code clipboard and reports the result', async () => {
   const harness = panelHarness([]);
@@ -499,10 +614,11 @@ it('keeps tool-call progress separate from the final answer and persists it befo
   const stored = sessions[0].transcript.find((item) => item.role === 'Reasoning');
   expect(stored?.text).toBe('I will create the requested file.');
   expect(sessions[0].transcript.map((item) => item.role)).toEqual(['You', 'Reasoning', 'Tool', 'DeepLocal']);
-  expect(sessions[0].transcript.at(-1)?.text).toBe('Created snake.html.');
+  expect(JSON.parse(sessions[0].transcript.at(-1)!.text)).toMatchObject({ verification: 'unverified', attempts: [{ tool: 'create_file', saved: true }] });
+  expect(harness.sent.filter(message => message.type === 'assistantFinal')[0].text).not.toBe('Created snake.html.');
 });
 
-it('retains partial progress when a model stream fails', async () => {
+it('reports interrupted evidence rather than promoting unfinished model prose', async () => {
   const harness = panelHarness([]);
   harness.client.streamChat = async function* () {
     yield { kind: 'text', value: 'I will inspect the workspace.' } as StreamEvent;
@@ -511,8 +627,8 @@ it('retains partial progress when a model stream fails', async () => {
   harness.send({ type: 'send', text: 'Inspect the project', model: 'test' });
   await vi.waitFor(() => expect(harness.sent.some((message) => message.type === 'assistantDone')).toBe(true));
   const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ transcript: Array<{ role: string; text: string }> }>;
-  expect(sessions[0].transcript.at(-1)).toEqual({ role: 'Reasoning', text: 'I will inspect the workspace.' });
-  expect(harness.sent.some((message) => message.type === 'assistantFinal')).toBe(false);
+  expect(JSON.parse(sessions[0].transcript.at(-1)!.text)).toMatchObject({ verification: 'interrupted', attempts: [], limitation: 'Stream interrupted' });
+  expect(harness.sent.find(message => message.type === 'assistantFinal')?.text).not.toContain('I will inspect the workspace.');
 });
 
 it('keeps provider summaries distinct and carries opaque Responses items across tools and follow-ups', async () => {
@@ -539,7 +655,9 @@ it('keeps provider summaries distinct and carries opaque Responses items across 
   expect(JSON.stringify(harness.sent)).not.toContain('opaque-secret');
   harness.send({ type: 'send', text: 'Please explain the result', model: 'test', useAgent: false });
   await vi.waitFor(() => expect(harness.requests).toHaveLength(3));
-  expect(harness.requests[2].messages.some(message => message.responseContext?.items[0]?.phase === 'final_answer')).toBe(true);
+  // The discarded unstructured completion must not survive as opaque context.
+  expect(harness.requests[2].messages.some(message => message.responseContext?.items[0]?.phase === 'final_answer')).toBe(false);
+  expect(harness.requests[2].messages.some(message => message.responseContext?.items[0]?.type === 'reasoning')).toBe(true);
   await vi.waitFor(() => expect(harness.sent.filter(message => message.type === 'assistantDone')).toHaveLength(2));
 });
 
@@ -586,7 +704,8 @@ it('reports step exhaustion instead of claiming completion', async () => {
   const approval = harness.sent.find((message) => message.type === 'approval')!;
   harness.send({ type: 'approval', approvalId: approval.approvalId, approved: false });
   await vi.waitFor(() => expect(harness.sent.some((message) => message.type === 'assistantDone')).toBe(true));
-  expect(harness.sent.some((message) => message.type === 'error' && String(message.message).includes('safety limit'))).toBe(true);
+  const final = harness.sent.find(message => message.type === 'assistantFinal')!;
+  expect(JSON.parse(final.text as string)).toMatchObject({ verification: 'interrupted', limitation: expect.stringContaining('safety limit') });
   expect(env.apply).not.toHaveBeenCalled();
 });
 
