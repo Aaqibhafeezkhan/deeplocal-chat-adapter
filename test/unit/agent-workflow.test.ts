@@ -8,6 +8,7 @@ import { ChatCompletionRequest, ChatMessage, StreamEvent } from '../../src/proto
 import { toolActivity } from '../../src/tool-activity';
 import { mkdtemp, writeFile, rm, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import type { CommandResult } from '../../src/command-runner';
 
 const env = vi.hoisted(() => ({
   files: new Map<string, string>(), dirty: false, version: 1,
@@ -18,7 +19,7 @@ const env = vi.hoisted(() => ({
   diagnosticListeners: new Set<(event: vscode.DiagnosticChangeEvent) => void>(),
   folders: [] as vscode.WorkspaceFolder[],
   foldersChanged: (_event: vscode.WorkspaceFoldersChangeEvent) => {},
-  config: { injectSystemPrompt: true, agentMaxTurns: 3, maxOutputTokens: 1000, backend: 'local', approvalMode: 'every' },
+  config: { injectSystemPrompt: true, agentMaxTurns: 3, agentMaxRepairIterations: 0, maxOutputTokens: 1000, backend: 'local', approvalMode: 'every' },
 }));
 
 vi.mock('../../src/config', () => ({ getConfig: () => env.config }));
@@ -89,8 +90,11 @@ beforeEach(() => {
   env.dirty = false;
   env.version = 1;
   env.config.agentMaxTurns = 3;
+  // Reporting-only fixtures finish immediately; repair scenarios opt in below.
+  env.config.agentMaxRepairIterations = 0;
+  env.config.approvalMode = 'every';
 });
-afterEach(() => vi.useRealTimers());
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 const createArgs = JSON.stringify({ path: 'snake.html', content: '<html>snake</html>' });
 
@@ -807,4 +811,151 @@ it('deletes only from the pinned root even if the options change during approval
   expect(env.trash).toHaveBeenCalledWith('/second/existing.ts', { recursive: false, useTrash: true });
   expect(env.files.get('/project/existing.ts')).toBe('important original');
   expect(env.files.has('/second/existing.ts')).toBe(false);
+});
+
+const verificationCall = (id: string, script = 'lint'): StreamEvent => ({ kind: 'toolCall', value: {
+  id, type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'npm', args: ['run', script], verification: true }) },
+} });
+const repairEdit = (id = 'repair-edit'): StreamEvent => ({ kind: 'toolCall', value: {
+  id, type: 'function', function: { name: 'write_file', arguments: JSON.stringify({ path: 'fixture.html', content: `fixed ${id}` }) },
+} });
+const submitRepair = (id: string, scripts: string[] = []): StreamEvent => ({ kind: 'toolCall', value: {
+  id, type: 'function', function: { name: 'submit_completion', arguments: JSON.stringify({ checks: scripts.map(script => ({ command: 'npm', args: ['run', script] })), nextSteps: '' }) },
+} });
+
+async function repairHarness(responses: StreamEvent[][], outcomes: Partial<CommandResult>[], limit = 3) {
+  env.config.agentMaxTurns = 30;
+  env.config.agentMaxRepairIterations = limit;
+  env.config.approvalMode = 'full';
+  const module = await import('../../src/agent-tools');
+  const original = module.invokeAgentTool;
+  const commands: string[] = [];
+  vi.spyOn(module, 'invokeAgentTool').mockImplementation(async (id, name, args, options) => {
+    if (name !== 'run_command') return original(id, name, args, options);
+    commands.push(id);
+    const input = JSON.parse(args);
+    const next = outcomes.shift();
+    if (!next) throw new Error('Unexpected command execution');
+    const command: CommandResult = { command: input.command, args: input.args, cwd: '/project', exitCode: 0, signal: null,
+      stdout: '', stderr: '', durationMs: 1, timedOut: false, cancelled: false, outputLimitExceeded: false, truncated: false, error: null, ...next };
+    return { callId: id, name, status: command.exitCode === 0 ? 'success' : 'error', content: JSON.stringify(command), command };
+  });
+  const harness = panelHarness(responses);
+  return { ...harness, commands, done: async () => {
+    await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'assistantDone')).toBe(true), { timeout: 5000 });
+    return harness.sent.find(message => message.type === 'assistantFinal')!.completionReport as {
+      verification: string; limitation?: string; checks: Array<{ state: string; command: string }>;
+      attempts: Array<{ id: string; state: string; exitCode?: number; saved?: boolean }>;
+    };
+  } };
+}
+
+it('repairs a failed verification after rejected completion and preserves Responses tool continuation', async () => {
+  const rejectedContext = { source: 'local:http://example.test/v1', model: 'test', items: [
+    { type: 'function_call', call_id: 'premature79', name: 'submit_completion', arguments: JSON.stringify({ checks: [], nextSteps: '' }) },
+  ] };
+  const harness = await repairHarness([
+    [verificationCall('lint79-first')],
+    [{ kind: 'responseContext', value: rejectedContext }, submitRepair('premature79')],
+    [repairEdit()], [verificationCall('lint79-fixed')], [submitRepair('finished79')],
+  ], [{ exitCode: 1, stderr: 'fixture.html:1 lint error' }, {}]);
+  harness.send({ type: 'send', model: 'test', text: 'Fix the lint error and verify it.' });
+  const report = await harness.done();
+  expect(report.verification).toBe('checks_passed');
+  expect(report.checks.map(check => check.state)).toEqual(['passed']);
+  expect(report.attempts.filter(attempt => attempt.exitCode !== undefined).map(attempt => attempt.exitCode)).toEqual([1, 0]);
+  expect(harness.requests[2].messages.find(message => message.tool_calls?.[0].id === 'premature79')?.responseContext).toEqual(rejectedContext);
+  expect(harness.requests[2].messages.find(message => message.tool_call_id === 'premature79')?.content).toContain('Verification is unresolved');
+  const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ transcript: Array<{ role: string; completionReport?: unknown }>; history: ChatMessage[] }>;
+  expect(sessions[0].transcript.filter(item => item.role === 'Tool')).toHaveLength(3);
+  expect(sessions[0].transcript.at(-1)?.completionReport).toEqual(report);
+  expect(JSON.parse(sessions[0].history.at(-1)!.content!)).toEqual(report);
+  env.config.approvalMode = 'every';
+});
+
+it('keeps a failed build required when later completion lists only passing lint', async () => {
+  const harness = await repairHarness([
+    [verificationCall('lint-pass')], [verificationCall('build-fail', 'build')], [submitRepair('omit-build', ['lint'])],
+    [repairEdit()], [verificationCall('lint-again')], [verificationCall('build-fixed', 'build')], [submitRepair('done-build', ['lint'])],
+  ], [{}, { exitCode: 2, stdout: 'TypeScript duplicate identifier' }, {}, {}]);
+  harness.send({ type: 'send', model: 'test', text: 'Fix lint and build.' });
+  const report = await harness.done();
+  expect(report.verification).toBe('checks_passed');
+  expect(report.checks).toHaveLength(2);
+  expect(report.checks.map(check => check.state)).toEqual(['passed', 'passed']);
+  expect(harness.requests[3].messages.at(-1)?.content).toContain('failed build');
+  expect(harness.commands).toEqual(['lint-pass', 'build-fail', 'lint-again', 'build-fixed']);
+  env.config.approvalMode = 'every';
+});
+
+it('stops identical diagnostic failures after a repair without requesting another model turn', async () => {
+  const harness = await repairHarness([
+    [verificationCall('first')], [repairEdit()], [verificationCall('second')],
+  ], [{ exitCode: 1, stderr: 'same diagnostic' }, { exitCode: 1, stderr: 'same diagnostic' }]);
+  env.config.agentMaxTurns = 3;
+  harness.send({ type: 'send', model: 'test', text: 'Repair lint.' });
+  const report = await harness.done();
+  expect(report.verification).toBe('failed');
+  expect(report.limitation).toContain('two identical failures');
+  expect(harness.requests).toHaveLength(3);
+  env.config.approvalMode = 'every';
+});
+
+it('suppresses an identical failed command when no repair changed workspace state', async () => {
+  const harness = await repairHarness([[verificationCall('first')], [verificationCall('blind-repeat')]], [{ exitCode: 1, stderr: 'broken' }]);
+  harness.send({ type: 'send', model: 'test', text: 'Fix lint.' });
+  const report = await harness.done();
+  expect(harness.commands).toEqual(['first']);
+  expect(report.checks[0].state).toBe('failed');
+  expect(report.attempts.at(-1)).toMatchObject({ id: 'blind-repeat', state: 'not_run' });
+  expect(report.limitation).toContain('already failed');
+  env.config.approvalMode = 'every';
+});
+
+it('stops changing failures at the configured repair boundary', async () => {
+  const harness = await repairHarness([[verificationCall('first')], [repairEdit()], [verificationCall('second')], [repairEdit('beyond-limit')]],
+    [{ exitCode: 1, stderr: 'first error' }, { exitCode: 1, stderr: 'different error' }], 1);
+  harness.send({ type: 'send', model: 'test', text: 'Repair lint.' });
+  const report = await harness.done();
+  expect(report.limitation).toContain('iteration limit (1)');
+  expect(report.verification).toBe('failed');
+  expect(harness.requests).toHaveLength(4);
+  expect(env.apply).toHaveBeenCalledOnce();
+  expect(report.attempts.at(-1)).toMatchObject({ id: 'beyond-limit', state: 'not_run' });
+  env.config.approvalMode = 'every';
+});
+
+it('requests missing verification after an edit without losing tool transcript or replaying unchecked prose', async () => {
+  const harness = await repairHarness([[repairEdit()], [{ kind: 'text', value: 'Everything passed, all fixed!' }],
+    [verificationCall('observed')], [submitRepair('finished')]], [{}]);
+  harness.send({ type: 'send', model: 'test', text: 'Change the source and verify it.' });
+  const report = await harness.done();
+  expect(report.verification).toBe('checks_passed');
+  expect(harness.requests[2].messages.at(-1)?.content).toContain('verification:true');
+  expect(JSON.stringify(harness.requests)).not.toContain('Everything passed, all fixed!');
+  const sessions = [...harness.state.values()].find(Array.isArray) as Array<{ transcript: Array<{ role: string }> }>;
+  expect(sessions[0].transcript.filter(item => item.role === 'Tool')).toHaveLength(2);
+  env.config.approvalMode = 'every';
+});
+
+it.each(['stop', 'workspace removal'])('cancels an active repair during approval on %s without executing later checks', async action => {
+  const harness = await repairHarness([[verificationCall('failed-before-stop')], [repairEdit()], [verificationCall('must-not-run')]],
+    [{ exitCode: 1, stderr: 'repair needed' }]);
+  env.config.approvalMode = 'every';
+  harness.send({ type: 'send', model: 'test', text: 'Repair and verify.' });
+  await vi.waitFor(() => expect(harness.sent.some(message => message.type === 'approval')).toBe(true));
+  if (action === 'stop') harness.send({ type: 'stop' });
+  else {
+    const removed = env.folders;
+    env.folders = [];
+    env.foldersChanged({ added: [], removed });
+  }
+  const report = await harness.done();
+  expect(report.verification).toBe('interrupted');
+  expect(report.attempts[0]).toMatchObject({ id: 'failed-before-stop', exitCode: 1 });
+  expect(harness.commands).toEqual(['failed-before-stop']);
+  expect(harness.requests).toHaveLength(2);
+  expect(env.apply).not.toHaveBeenCalled();
+  expect(harness.sent).toContainEqual({ type: 'assistantDone', outcome: 'cancelled' });
+  expect(harness.sent.some(message => message.type === 'approvalDone')).toBe(true);
 });

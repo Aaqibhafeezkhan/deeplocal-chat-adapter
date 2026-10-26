@@ -346,6 +346,42 @@ for (const scenario of [
   });
 }
 
+for (const limitation of [
+  'Verification stopped after two identical failures. Inspect the recorded diagnostics before continuing.',
+  'Repair iteration limit reached (3). Verification remains incomplete; review the failed check.',
+]) {
+  test(`host repair stop remains failed and unchanged through copy/restore: ${limitation}`, async ({ page }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'repair79-browser-'));
+    try {
+      const args = ['-e', "console.error('fixture.ts:1:1 lint error remains');process.exitCode=1"];
+      const command = await executeCommand('node', args, directory);
+      const evidence = new TaskEvidence();
+      evidence.record({ id: 'lint79', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'node', args, verification: true }) } },
+        { callId: 'lint79', name: 'run_command', status: 'error', content: 'lint failed', command });
+      const report = { ...evidence.report(JSON.stringify({ checks: [], nextSteps: 'All fixed and verified.' })), limitation };
+      const text = formatCompletion(report);
+      await page.setViewportSize({ width: 260, height: 820 });
+      await dispatch(page, { type: 'assistantStart', agent: true });
+      await dispatch(page, { type: 'assistantFinal', text, completionReport: report });
+      await dispatch(page, { type: 'assistantDone', outcome: 'success' });
+      for (const restored of [false, true]) {
+        if (restored) await dispatch(page, { type: 'restore', items: [{ role: 'DeepLocal', text, completionReport: report }] });
+        await expect(page.locator('.completion-status')).toHaveText('Verification: failed');
+        await expect(page.getByRole('list', { name: 'Declared checks' })).toContainText('failed');
+        await expect(page.locator('.completion-report')).toContainText(limitation);
+        await expect(page.locator('.model-suggestions .prose')).not.toBeVisible();
+        await page.locator('.completion-report > details:not(.model-suggestions) > summary').press('Enter');
+        await expect(page.locator('.completion-report pre')).toContainText('fixture.ts:1:1 lint error remains');
+        await page.getByRole('button', { name: 'Copy assistant message' }).click();
+        const copied = await page.evaluate(() => window.__messages.at(-1));
+        expect(copied).toMatchObject({ type: 'copy', text });
+        expect(JSON.parse(copied!.text as string)).toEqual(report);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      }
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
 test('empty, interrupted and blocked completion reports preserve their limits', async ({ page }) => {
   const evidence = new TaskEvidence();
   const reports = [evidence.report(), evidence.report(undefined, 'Task stopped; no tools ran.'),

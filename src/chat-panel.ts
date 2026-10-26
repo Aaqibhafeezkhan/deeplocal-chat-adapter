@@ -12,6 +12,7 @@ import { runReview } from './review-runner';
 import { formatReviewReport } from './review-report';
 import { ReviewRequest, ReviewReport } from './review-types';
 import { completionTool, CompletionReport, formatCompletion, TaskEvidence } from './task-evidence';
+import { AgentRepair } from './agent-repair';
 
 interface WebviewMessage {
   type: 'selectWorkspace' | 'ready' | 'send' | 'stop' | 'approval' | 'preview' | 'refreshModels' | 'newSession' | 'switchSession' | 'deleteSession' | 'setBackend' | 'setRemoteApiKey' | 'clearRemoteApiKey' | 'setApiMode' | 'setSummary' | 'setApprovalMode' | 'copy' | 'setWorkflow' | 'openReviewReference' | 'copyReview';
@@ -510,6 +511,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
             'Use get_active_file and get_selection before editing the active editor when relevant.',
             'TypeScript file tools reject new duplicate import bindings and report observed diagnostic changes after saving. A saved edit can still have validation errors. Read each tool result, repair newly reported errors with targeted edits, and never blindly retry a rejected write. A reduction in lint warnings does not compensate for new compilation errors.',
             'Use get_diagnostics and relevant workspace build, lint and test commands to verify fixes. Automatic diagnostic observations are bounded and may be inconclusive; they are not proof of successful compilation. If existing errors remain, report them and do not claim that all errors are fixed. Report exactly which verification commands ran.',
+            'For source changes, inspect existing project scripts and mark relevant run_command calls with verification:true. Inspect the complete result, including stdout, stderr, exit status and incomplete-output flags. Recoverable verification failures require targeted repair and another check within the host repair limit. Never replace a failed build with a passing lint result. Explanation-only tasks do not need verification. Do not blindly repeat an unchanged failed command or retry denied actions.',
             'Prefer small targeted edits. Before each group of tool calls, give a brief user-visible progress update (one or two sentences) describing what you are about to inspect or change and why. After tools return, summarize relevant findings and the next step. These are concise action summaries, not private chain-of-thought or hidden reasoning. Explain what changed after tools finish.',
             'Ask before destructive work; file write and command tools already require user confirmation.',
             'After creating a file, use open_file if appropriate. Check diagnostics or run relevant tests. Report whether verification actually ran.',
@@ -621,11 +623,22 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     evidence: TaskEvidence,
   ): Promise<string> {
     const workingMessages = [...messages];
+    const repairLimit = getConfig().agentMaxRepairIterations ?? 3;
+    const repair = new AgentRepair(repairLimit);
+    let completionRaw: string | undefined;
+    const finish = (limitation?: string): string => {
+      const report = evidence.report(completionRaw);
+      if (limitation) report.limitation = limitation;
+      assistantItem.completionReport = report;
+      assistantItem.text = '';
+      return formatCompletion(report);
+    };
     let finalAnswer = '';
 
     for (let turn = 0; turn < getConfig().agentMaxTurns; turn += 1) {
       signal.throwIfAborted();
       requireWorkspaceFolder(folder);
+      if (repair.stopped) { finalAnswer = finish(repair.stopped); break; }
       session.transcript = session.transcript.filter((item) => item !== assistantItem);
       session.transcript.push(assistantItem);
       this.post({ type: 'status', message: `Working · step ${turn + 1}` });
@@ -658,8 +671,16 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         // An agent can hallucinate a passed build before its first tool, too.
         // Chat/Ask keep prose; Agent completions require observed evidence.
         if (!answer.trim()) throw new Error('The model returned no answer or tool actions. Retry or choose another model.');
-        assistantItem.completionReport = evidence.report();
-        finalAnswer = formatCompletion(assistantItem.completionReport);
+        const guidance = repair.completion(evidence.repairState());
+        if (guidance) {
+          // Do not replay unchecked final prose (including opaque Responses output).
+          workingMessages.push({ role: 'system', content: guidance });
+          assistantItem.text = '';
+          this.post({ type: 'status', message: 'Verification unresolved · continuing repair' });
+          await this.persist();
+          continue;
+        }
+        finalAnswer = finish(repair.stopped);
         break;
       }
 
@@ -667,9 +688,23 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       const submission = toolCalls.find(call => call.function.name === 'submit_completion');
       if (submission) {
         if (toolCalls.length !== 1) throw new Error('submit_completion must be the only tool call in the final turn.');
-        assistantItem.completionReport = evidence.report(submission.function.arguments);
-        finalAnswer = formatCompletion(assistantItem.completionReport);
-        assistantItem.text = '';
+        // Validate and register declarations before checking whether completion is allowed.
+        const proposed = evidence.report(submission.function.arguments);
+        completionRaw = submission.function.arguments;
+        const guidance = repair.completion(evidence.repairState());
+        if (guidance && !proposed.limitation) {
+          const continuation: ChatMessage[] = [
+            { role: 'assistant', content: null, tool_calls: toolCalls, ...(responseContext ? { responseContext } : {}) },
+            { role: 'tool', tool_call_id: submission.id, content: guidance },
+          ];
+          workingMessages.push(...continuation);
+          session.history.push(...continuation);
+          assistantItem.text = '';
+          this.post({ type: 'status', message: 'Verification unresolved · continuing repair' });
+          await this.persist();
+          continue;
+        }
+        finalAnswer = finish(repair.stopped);
         break;
       }
       if (answer.trim()) {
@@ -697,13 +732,22 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         const activity = toolActivity(`${requestId}:${turn}:${call.id}`, call);
         this.post({ type: 'status', message: `${activity.title}${activity.detail ? ` · ${activity.detail}` : ''}` });
         this.post({ type: 'toolStart', activity });
-        const result = await invokeAgentTool(call.id, call.function.name, call.function.arguments, {
+        const mutating = ['create_file', 'write_file', 'replace_in_file', 'delete_file'].includes(call.function.name);
+        const retryBlock = repair.stopped ?? evidence.commandRetryBlock(call) ?? (mutating ? repair.beforeMutation() : undefined);
+        if (retryBlock) repair.stop(retryBlock);
+        const result = retryBlock
+          ? { callId: call.id, name: call.function.name, content: `${retryBlock} Tool was not executed.`, status: 'error' as const }
+          : await invokeAgentTool(call.id, call.function.name, call.function.arguments, {
           signal,
           workspaceFolder: folder,
           approvalMode: getConfig().approvalMode ?? 'safe',
           approve: (message, preview) => this.requestApproval(message, signal, preview),
         });
-        evidence.record(call, result);
+        evidence.record(call, result, !retryBlock);
+        if (result.status === 'declined' && repairLimit > 0) {
+          repair.stop('The user declined an action. Verification is blocked; no automatic retry was made.');
+        }
+        repair.observe(evidence.repairState());
         results.push(result);
         activity.state = signal.aborted ? 'cancelled' : result.status;
         if (call.function.name === 'write_file' && result.status === 'success') {
@@ -720,6 +764,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       signal.throwIfAborted();
     }
 
+    if (!finalAnswer && repair.stopped) finalAnswer = finish(repair.stopped);
     if (!finalAnswer) throw new Error('Agent safety limit reached after many tool steps. Work may be incomplete; review the tool results and ask to continue.');
     return finalAnswer;
   }

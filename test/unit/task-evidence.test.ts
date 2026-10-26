@@ -15,7 +15,7 @@ it('reports failed checks and retains failures omitted from declarations', () =>
   evidence.record(call('lint'), result('lint', command({ exitCode: 1, stderr: 'src/main.ts:8 lint error' })));
   expect(evidence.report(finish()).verification).toBe('failed');
   const omitted = evidence.report(finish([]));
-  expect(omitted.verification).toBe('unverified');
+  expect(omitted.verification).toBe('failed');
   expect(omitted.attempts[0]).toMatchObject({ state: 'failed', exitCode: 1 });
   expect(omitted.attempts[0].detail).toContain('src/main.ts:8');
 });
@@ -130,4 +130,160 @@ it('bounds/redacts report metadata and preserves user-language suggestions witho
 it('rejects duplicate calls before a batch executes and bounds task evidence', () => {
   const evidence = new TaskEvidence(); expect(() => evidence.reserve([call('one'), call('one')])).toThrow();
   expect(() => new TaskEvidence().reserve(Array.from({ length: 33 }, (_, i) => call(String(i))))).toThrow();
+});
+
+const verify = (id: string, executable = 'npm', args = ['run', 'lint']): ToolCall => {
+  const invocation = call(id, executable, args);
+  invocation.function.arguments = JSON.stringify({ command: executable, args, verification: true });
+  return invocation;
+};
+const edit = (evidence: TaskEvidence, id = 'edit', diagnostics?: { state: 'observed'; newErrors: number; remainingErrors: number }) => {
+  evidence.record({ id, type: 'function', function: { name: 'write_file', arguments: '{}' } },
+    { callId: id, name: 'write_file', status: 'success', content: 'saved', edit: { path: 'main.ts', saved: true, diagnostics } });
+};
+
+it('retains the union of verification calls and valid completion declarations across omissions', () => {
+  const evidence = new TaskEvidence();
+  evidence.record(verify('lint'), result('lint', command({ exitCode: 1 })));
+  evidence.record(call('probe', 'git', ['show', 'missing']), result('probe', command({ exitCode: 128 })));
+  evidence.report(finish([{ command: 'npm', args: ['run', 'build'], notRun: 'blocked', reason: 'Build ist gesperrt.' }]));
+  const report = evidence.report(finish([]));
+  expect(report.checks.map(check => check.state)).toEqual(['failed', 'blocked']);
+  expect(report.unverifiedModelText.checkReasons).toEqual([{ command: '["npm","run","build"]', text: 'Build ist gesperrt.' }]);
+  expect(report.attempts).toHaveLength(2);
+  expect(evidence.repairState().checks[1].blocked).toBe(false); // Model label is not an observed infrastructure block.
+  edit(evidence);
+  expect(evidence.report(finish([])).checks[0].state).toBe('stale');
+});
+
+it('activates earlier exploration attempts only after full declaration validation', () => {
+  const evidence = new TaskEvidence(); evidence.record(call('probe'), result('probe', command({ exitCode: 1 })));
+  expect(evidence.repairState().checks).toEqual([]);
+  expect(evidence.commandRetryBlock(call('retry'))).toBeUndefined();
+  expect(() => evidence.report(finish([{ command: 'npm', args: ['run', 'lint'] }, { command: 'bad', args: [], state: 'passed' }]))).toThrow();
+  expect(evidence.repairState().checks).toEqual([]);
+  evidence.report(finish());
+  expect(evidence.repairState().checks[0]).toMatchObject({ state: 'failed', attemptId: 'probe', generation: 0 });
+  expect(evidence.commandRetryBlock(call('retry'))).toContain('already failed');
+});
+
+it('blocks declined commands permanently and failed checks until mutation, ignoring synthetic suppression', () => {
+  const evidence = new TaskEvidence(); evidence.record(verify('fail'), result('fail', command({ truncated: true })));
+  expect(evidence.commandRetryBlock(call('again'))).toContain('incomplete');
+  evidence.record(call('suppressed'), { callId: 'suppressed', name: 'run_command', status: 'error', content: 'suppressed' }, false);
+  expect(evidence.repairState().checks[0]).toMatchObject({ state: 'incomplete', attemptId: 'fail' });
+  edit(evidence);
+  expect(evidence.commandRetryBlock(call('after-edit'))).toBeUndefined();
+  evidence.record(call('denied', 'node', ['test']), { callId: 'denied', name: 'run_command', status: 'declined', content: 'User declined' });
+  edit(evidence, 'second-edit');
+  expect(evidence.commandRetryBlock(call('retry-denied', 'node', ['test']))).toContain('declined');
+  expect(evidence.commandRetryBlock(call('other', 'node', ['other']))).toBeUndefined();
+});
+
+it('exposes independent snapshots, current saved diagnostics and real infrastructure blocks', () => {
+  const evidence = new TaskEvidence();
+  evidence.record(verify('spawn'), result('spawn', command({ exitCode: null, error: { code: 'ENOENT', message: 'Missing' } })));
+  const snapshot = evidence.repairState();
+  expect(snapshot).toMatchObject({ generation: 0, mutated: false, diagnosticErrors: false, checks: [{ blocked: true, state: 'failed' }] });
+  evidence.record(verify('workspace', 'node', []), { callId: 'workspace', name: 'run_command', status: 'error', content: 'Commands require a local workspace folder.' });
+  expect(evidence.repairState().checks[1]).toMatchObject({ blocked: true, state: 'failed' });
+  snapshot.checks[0].args.push('changed'); snapshot.checks[0].state = 'passed';
+  expect(evidence.repairState().checks[0]).toMatchObject({ args: ['run', 'lint'], state: 'failed' });
+  edit(evidence, 'errors', { state: 'observed', newErrors: 1, remainingErrors: 0 });
+  expect(evidence.repairState()).toMatchObject({ generation: 1, mutated: true, diagnosticErrors: true });
+  edit(evidence, 'clear', { state: 'observed', newErrors: 0, remainingErrors: 0 });
+  expect(evidence.repairState().diagnosticErrors).toBe(false);
+});
+
+it('fingerprints full sanitized evidence stably across generations and durations', () => {
+  const evidence = new TaskEvidence();
+  evidence.record(verify('first'), result('first', command({ exitCode: 1, stdout: '\u001b[31merror\u001b[0m  \r\nAPI_KEY=firstSecret\r\n', stderr: 'detail  \r\n' })));
+  const first = evidence.repairState().checks[0].fingerprint;
+  expect(first).toMatch(/^[a-f0-9]{64}$/);
+  edit(evidence);
+  evidence.record(verify('same'), result('same', command({ exitCode: 1, stdout: 'error\nAPI_KEY=secondSecret\n', stderr: 'detail\n', durationMs: 999 })));
+  expect(evidence.repairState().checks[0].fingerprint).toBe(first);
+  evidence.record(verify('different'), result('different', command({ exitCode: 1, stdout: 'error\nAPI_KEY=secondSecret\n', stderr: 'different diagnostic' })));
+  expect(evidence.repairState().checks[0].fingerprint).not.toBe(first);
+  const middle = (text: string) => 'a'.repeat(1000) + text + 'z'.repeat(1000);
+  evidence.record(verify('middle1'), result('middle1', command({ stdout: middle('one') })));
+  const middle1 = evidence.repairState().checks[0].fingerprint;
+  evidence.record(verify('middle2'), result('middle2', command({ stdout: middle('two') })));
+  expect(evidence.repairState().checks[0].fingerprint).not.toBe(middle1);
+  const complete = evidence.repairState().checks[0].fingerprint;
+  evidence.record(verify('limited'), result('limited', command({ stdout: middle('two'), outputLimitExceeded: true })));
+  expect(evidence.repairState().checks[0].fingerprint).not.toBe(complete);
+});
+
+it('settles saved editor errors only once the full known verification union passes after the edit', () => {
+  const evidence = new TaskEvidence();
+  evidence.report(finish([{ command: 'npm', args: ['run', 'lint'] }, { command: 'npm', args: ['run', 'build'] }]));
+  edit(evidence, 'errors', { state: 'observed', newErrors: 1, remainingErrors: 2 });
+  evidence.record(call('lint'), result('lint'));
+  expect(evidence.repairState().diagnosticErrors).toBe(true);
+  evidence.record(call('build', 'npm', ['run', 'build']), result('build'));
+  expect(evidence.repairState().diagnosticErrors).toBe(false);
+  edit(evidence, 'next-errors', { state: 'observed', newErrors: 1, remainingErrors: 0 });
+  expect(evidence.repairState().diagnosticErrors).toBe(true);
+});
+
+it('fails closed when known verification declarations exceed the bounded task cap', () => {
+  const evidence = new TaskEvidence();
+  const checks = Array.from({ length: 20 }, (_, index) => ({ command: 'npm', args: [String(index)] }));
+  evidence.report(finish(checks));
+  expect(() => evidence.report(finish([{ command: 'node', args: [] }]))).toThrow(/limit/);
+  evidence.record(verify('overflow', 'node', []), result('overflow'));
+  expect(evidence.repairState().checks).toHaveLength(20);
+  expect(evidence.report().limitation).toContain('limit');
+  expect(evidence.report().verification).toBe('unverified');
+});
+
+it('normalizes command retries exactly like execution including omitted and coerced arguments', () => {
+  const evidence = new TaskEvidence();
+  const denied: AgentToolResult = { callId: 'denied', name: 'run_command', status: 'declined', content: 'User declined' };
+  evidence.record(call('denied', 'node', []), denied);
+  const omitted = call('omitted', 'node'); omitted.function.arguments = JSON.stringify({ command: ' node ' });
+  expect(evidence.commandRetryBlock(omitted)).toContain('declined');
+  evidence.record(call('number', 'node', ['1', 'null', 'false']), { ...denied, callId: 'number' });
+  const coerced = call('coerced'); coerced.function.arguments = JSON.stringify({ command: 'node', args: [1, null, false] });
+  expect(evidence.commandRetryBlock(coerced)).toContain('declined');
+  evidence.record(verify('fail', 'node', []), result('fail', command({ exitCode: 1 })));
+  const failed = call('failed'); failed.function.arguments = JSON.stringify({ command: 'node', args: 'not-an-array' });
+  expect(evidence.commandRetryBlock(failed)).toContain('declined');
+  const failedOnly = new TaskEvidence();
+  failedOnly.record(verify('fail', 'node', []), result('fail', command({ exitCode: 1 })));
+  expect(failedOnly.commandRetryBlock(failed)).toContain('already failed');
+});
+
+it('blocks denied non-command actions despite reordered JSON without exposing argument content', () => {
+  const evidence = new TaskEvidence();
+  const write: ToolCall = { id: 'write', type: 'function', function: { name: 'write_file', arguments: JSON.stringify({ path: 'file.ts', content: 'privateValue', extra: { z: 1, a: 2 } }) } };
+  evidence.record(write, { callId: write.id, name: 'write_file', status: 'declined', content: 'User declined' });
+  const retry = { ...write, id: 'retry', function: { ...write.function, arguments: JSON.stringify({ extra: { a: 2, z: 1 }, content: 'privateValue', path: 'file.ts' }) } };
+  expect(evidence.commandRetryBlock(retry)).toContain('declined');
+  expect(evidence.commandRetryBlock(retry)).not.toContain('privateValue');
+  expect(evidence.commandRetryBlock({ ...retry, function: { ...retry.function, arguments: JSON.stringify({ path: 'other.ts', content: 'privateValue' }) } })).toBeUndefined();
+  evidence.record(retry, { callId: retry.id, name: 'write_file', status: 'declined', content: 'synthetic' }, false);
+  expect(evidence.repairState().generation).toBe(0);
+});
+
+it.each([['blocked'], ['skipped'], 1, null, {}])('rejects nonliteral notRun enum values: %j', notRun => {
+  const evidence = new TaskEvidence();
+  expect(() => evidence.report(finish([{ command: 'npm', args: [], notRun }]))).toThrow();
+  expect(evidence.repairState().checks).toEqual([]);
+});
+
+it.each([['x'.repeat(513), []], ['node', Array.from({ length: 129 }, () => 'x')], ['node', ['x'.repeat(20001)]]])(
+  'fails closed for verification declarations exceeding completion identity bounds', (executable, argv) => {
+    const evidence = new TaskEvidence(); evidence.record(verify('oversized', executable as string, argv as string[]), result('oversized'));
+    expect(evidence.report().verification).toBe('unverified');
+    expect(evidence.report().limitation).toContain('limit');
+  });
+
+it('verification:false cannot remove an existing obligation', () => {
+  const evidence = new TaskEvidence(); evidence.record(verify('failed'), result('failed', command({ exitCode: 1 })));
+  const retry = call('later'); retry.function.arguments = JSON.stringify({ command: 'npm', args: ['run', 'lint'], verification: false });
+  expect(evidence.commandRetryBlock(retry)).toContain('already failed');
+  evidence.record(retry, { callId: retry.id, name: 'run_command', status: 'error', content: 'suppressed' }, false);
+  expect(evidence.report(finish([])).checks[0]).toMatchObject({ state: 'failed', attempts: ['failed', 'later'] });
 });
