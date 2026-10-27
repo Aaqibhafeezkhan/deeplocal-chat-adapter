@@ -124,6 +124,14 @@
           "maximum": 1000,
           "description": "Safety limit for tool-use turns in one DeepLocal agent request. The default is high enough that normal tasks do not stop because of this setting."
         },
+        "deeplocal.verificationPreferences": {
+          "type": "array",
+          "scope": "resource",
+          "default": [],
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["lint", "typecheck", "build", "test"] },
+          "description": "Preferred verification categories for Agent tasks. Empty automatically selects available project checks; a non-empty list limits suggested checks to the selected categories."
+        },
         "deeplocal.agentMaxRepairIterations": {
           "type": "integer",
           "default": 3,

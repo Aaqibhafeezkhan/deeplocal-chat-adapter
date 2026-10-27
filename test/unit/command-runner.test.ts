@@ -30,6 +30,12 @@ it('represents a successful no-output process without inventing diagnostics', as
   expect(await run('')).toMatchObject({ exitCode: 0, stdout: '', stderr: '', truncated: false });
 });
 
+it('launches the installed npm CLI without an implicit shell and preserves its evidence identity', async () => {
+  const result = await executeCommand('npm', ['--version'], cwd);
+  expect(result).toMatchObject({ command: 'npm', args: ['--version'], cwd, exitCode: 0, error: null });
+  expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+});
+
 it('distinguishes a missing executable and invalid cwd from a nonzero process exit', async () => {
   for (const result of [await executeCommand('missing-synthetic-command-78', [], cwd), await executeCommand(process.execPath, [], join(cwd, 'missing'))]) {
     expect(result).toMatchObject({ exitCode: null, signal: null, stdout: '', stderr: '', error: { code: 'ENOENT' } });
