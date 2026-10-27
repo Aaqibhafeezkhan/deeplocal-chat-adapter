@@ -319,6 +319,22 @@ metadata; the host derives their outcome from recorded command evidence. Failed
 lint and build checks remain independent, so a passing build cannot clear a lint
 failure. File edits make earlier verification stale and require fresh checks.
 
+The `discover_verification_commands` tool reads manifests in the selected workspace,
+including nested packages, and reports candidate lint, type-check, build, and test
+commands without executing them. It prefers existing package scripts and also
+recognizes common Rust, Go, Python, Maven, and Gradle configuration. The agent
+selects checks relevant to its changes; discovery is not an instruction to run
+every project check. Missing categories and known unsafe scripts are reported.
+Lint, type checking, builds, and tests retain their own recorded outcomes.
+
+Set `deeplocal.verificationPreferences` to a list such as `["lint", "typecheck", "test"]`
+to limit suggestions, including per-workspace-folder preferences. The default
+empty list discovers all available categories. Safe approval mode also inspects
+package-script delegation and lifecycle hooks before execution. Unsafe or
+uninspectable package invocations and opaque shell wrappers require approval;
+Full access and Ask-only modes retain their existing behavior. These checks use
+finite heuristics, not a sandbox for arbitrary project code.
+
 After failed or missing verification, the agent can inspect the failure, make
 targeted repairs and rerun the relevant checks. A repair cycle can include
 multiple file edits and verification commands; lint, build and test commands do
@@ -460,6 +476,7 @@ return models successfully.
 | `deeplocal.injectSystemPrompt` | `true` | Adds the extension's compact coding-assistant prompt. |
 | `deeplocal.agentMaxTurns` | `100` | Agent tool-use safety limit, configurable from 1 through 1000. |
 | `deeplocal.agentMaxRepairIterations` | `3` | Maximum verification repair cycles, from 0 through 20; 0 disables automatic repair while retaining accurate evidence. |
+| `deeplocal.verificationPreferences` | `[]` | Limit suggested verification categories to `lint`, `typecheck`, `build`, and/or `test`; an empty list discovers all available categories. |
 | `deeplocal.approvalMode` | `safe` | Default approval behavior for sidebar agent tasks. |
 | `deeplocal.logLevel` | `info` | Extension output logging level. |
 

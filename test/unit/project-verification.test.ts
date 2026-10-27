@@ -56,4 +56,43 @@ describe('discoverProjectVerification', () => {
       ['services/api/package.json', 'yarn', 'build'], ['services/api/package.json', 'yarn', 'test'],
     ]);
   });
+
+  it('uses a local npm lockfile before an ancestor package manager', () => {
+    const report = discoverProjectVerification([{ path: 'apps/web/package.json', scripts: { test: 'vitest run' } }], {
+      'apps/web/package.json': '{}', 'apps/web/package-lock.json': '', 'yarn.lock': '',
+    }, ['test']);
+    expect(report.commands[0]).toMatchObject({ command: 'npm', args: ['--prefix', 'apps/web', 'run', 'test'] });
+  });
+
+  it('uses the nearest ancestor workspace lockfile', () => {
+    const report = discoverProjectVerification([{ path: 'apps/web/package.json', scripts: { test: 'vitest run' } }], {
+      'apps/web/package.json': '{}', 'apps/pnpm-lock.yaml': '', 'yarn.lock': '',
+    }, ['test']);
+    expect(report.commands[0].command).toBe('pnpm');
+  });
+
+  it.each(['npm ci', 'npm publish', 'pnpm add example', 'pip install example', 'rm -r output', 'npx example'])('does not automatically recommend %s', body => {
+    const report = discoverProjectVerification([{ path: 'package.json', scripts: { build: body } }], { 'package.json': '{}' }, ['build']);
+    expect(report.commands).toEqual([]);
+    expect(report.skippedUnsafe).toMatchObject([{ script: 'build' }]);
+  });
+
+  it('accepts shared safe dependencies but rejects recursion and unknown delegates', () => {
+    const scripts = { lint: 'npm run shared && npm run shared', shared: 'eslint .' };
+    expect(isUnsafeVerificationScript('lint', scripts.lint, scripts)).toBe(false);
+    expect(isUnsafeVerificationScript('lint', 'npm run missing', {})).toBe(true);
+    expect(isUnsafeVerificationScript('lint', 'npm run other', { other: 'npm run lint', lint: 'npm run other' })).toBe(true);
+    expect(isUnsafeVerificationScript('lint', 'eslint .', { postlint: 'npm publish' })).toBe(true);
+  });
+
+  it.each(['pnpm ship', 'yarn run-script ship', 'npm run ship', 'NPM.CMD run ship', 'pnpm.cmd ship'])('inspects delegated script %s', body => {
+    expect(isUnsafeVerificationScript('lint', body, { ship: 'git push' })).toBe(true);
+  });
+
+  it('reports unavailable scripts without inventing commands and can use a safe alias', () => {
+    const report = discoverProjectVerification([{ path: 'package.json', scripts: { lint: 'npm run deploy', 'lint:check': 'eslint .' } }], { 'package.json': '{}' });
+    expect(report.commands.map(item => item.script)).toEqual(['lint:check']);
+    expect(report.skippedUnsafe.map(item => item.script)).toEqual(['lint']);
+    expect(report.missing.map(item => item.category)).toEqual(['typecheck', 'build', 'test']);
+  });
 });

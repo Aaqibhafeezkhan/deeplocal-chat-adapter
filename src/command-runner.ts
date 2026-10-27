@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import * as path from 'node:path';
 import { boundedCommandText, redactCommandOutput } from './command-output';
 
 export interface CommandResult {
@@ -15,6 +17,29 @@ export interface CommandResult {
   outputLimitExceeded: boolean;
   truncated: boolean;
   error: { code: string; message: string } | null;
+}
+
+// Windows package managers normally expose .cmd shims, which spawn(shell:false)
+// cannot execute. Launch their installed JS entry points with Node instead of
+// introducing a shell or changing the recorded command/evidence identity.
+function packageManagerLaunch(command: string, args: string[], cwd: string): { command: string; args: string[] } {
+  const original = { command, args };
+  if (process.platform !== 'win32') return original;
+  const name = path.basename(command).toLowerCase().replace(/\.cmd$/, '');
+  if (!['npm', 'pnpm', 'yarn'].includes(name)) return original;
+  const explicit = /[\\/]/.test(command);
+  const directories = explicit ? [path.dirname(path.resolve(cwd, command))] : (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  const entryPoints: Record<string, string> = { npm: 'npm/bin/npm-cli.js', pnpm: 'pnpm/bin/pnpm.cjs', yarn: 'yarn/bin/yarn.js' };
+  for (const directory of directories) {
+    if (!explicit && existsSync(path.join(directory, name + '.exe'))) return original;
+    if (!existsSync(path.join(directory, name + '.cmd'))) continue;
+    const entry = [path.join(directory, 'node_modules', entryPoints[name]), path.join(directory, 'node_modules/corepack/dist', name + '.js')]
+      .find(candidate => existsSync(candidate));
+    if (!entry) return original;
+    const node = path.join(directory, 'node.exe');
+    return { command: existsSync(node) ? node : 'node', args: [entry, ...args] };
+  }
+  return original;
 }
 
 /** Internal limits may be lowered by tests; tool arguments cannot raise them. */
@@ -40,7 +65,8 @@ export async function executeCommand(command: string, args: string[], cwd: strin
       output.error = { code, message: `Unable to run command (${code}). Check the executable and working directory.` };
     };
     try {
-      child = spawn(command, args, { cwd, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+      const launch = packageManagerLaunch(command, args, cwd);
+      child = spawn(launch.command, launch.args, { cwd, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (error) { failed(error as NodeJS.ErrnoException); resolve(); return; }
     const stop = () => {
       if (stopping) return;

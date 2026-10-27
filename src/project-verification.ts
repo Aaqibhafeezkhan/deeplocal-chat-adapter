@@ -21,31 +21,37 @@ const aliases: Record<VerificationCategory, string[]> = {
 };
 const unsafeScriptName = /(?:^|[:_-])(install|uninstall|publish|deploy|release|migrate|destroy|clean|reset|teardown|remove|delete)(?:$|[:_-])/i;
 const unsafeScriptBody = /\b(?:npm|pnpm|yarn)\s+(?:(?:run\s+)?(?:install|add|publish|deploy|release)|(?:exec|dlx)\s+)/i;
-const unsafeCommandBody = /\b(?:git\s+push|terraform\s+apply|kubectl\s+delete|docker\s+push)\b|\brm\s+-rf\b|\b(?:drop|truncate)\s+(?:database|table)\b|\|\s*(?:sh|bash)\b/i;
+const unsafeCommandBody = /\b(?:git\s+push|terraform\s+apply|kubectl\s+delete|docker\s+push)\b|\b(?:rm|rmdir|del|Remove-Item|npx)\b|\b(?:pip3?|uv|poetry)\s+(?:install|add|sync)\b|\b(?:drop|truncate)\s+(?:database|table)\b|\|\s*(?:sh|bash)\b/i;
 export function isUnsafeVerificationScript(name: string, body: string, scripts: Record<string, string> = {}, visited = new Set<string>()): boolean {
   if (unsafeScriptName.test(name) || unsafeScriptBody.test(body) || unsafeCommandBody.test(body)) return true;
   if (visited.has(name)) return true;
-  visited.add(name);
+  const ancestors = new Set(visited).add(name);
   for (const lifecycle of [`pre${name}`, `post${name}`]) {
     const lifecycleBody = scripts[lifecycle];
-    if (lifecycleBody && isUnsafeVerificationScript(lifecycle, lifecycleBody, scripts, visited)) return true;
+    if (lifecycleBody && isUnsafeVerificationScript(lifecycle, lifecycleBody, scripts, ancestors)) return true;
   }
-  for (const match of body.matchAll(/\b(?:npm|pnpm|yarn)\s+run\s+([a-zA-Z0-9:_-]+)/g)) {
-    const delegatedName = match[1];
+  const packageCalls = [...body.matchAll(/\b(npm|pnpm|yarn)(?:\.cmd)?\s+(?:(run|run-script)\s+)?([a-zA-Z0-9:_-]+)/gi)];
+  // Options or dynamic shell syntax can hide a different package/directory.
+  // Treat an invocation we cannot inspect as requiring approval.
+  if (packageCalls.length !== [...body.matchAll(/\b(?:npm|pnpm|yarn)(?:\.cmd)?\s+/gi)].length) return true;
+  for (const match of packageCalls) {
+    const delegatedName = match[3];
+    if (match[1].toLowerCase() === 'npm' && !match[2] && !['test', 'start', 'stop', 'restart'].includes(delegatedName)) return true;
     const delegatedBody = scripts[delegatedName];
-    if (unsafeScriptName.test(delegatedName) || (delegatedBody !== undefined && isUnsafeVerificationScript(delegatedName, delegatedBody, scripts, visited))) return true;
+    if (unsafeScriptName.test(delegatedName) || delegatedBody === undefined || isUnsafeVerificationScript(delegatedName, delegatedBody, scripts, ancestors)) return true;
   }
   return false;
 }
 function packageManager(manifest: string, files: Record<string, string>): string {
-  const directory = projectDirectory(manifest);
-  const names = Object.keys(files);
-  const has = (name: string) => names.includes([directory, name].filter(Boolean).join('/'));
-  if (has('pnpm-lock.yaml')) return 'pnpm';
-  if (has('yarn.lock')) return 'yarn';
-  if (directory && names.includes('pnpm-lock.yaml')) return 'pnpm';
-  if (directory && names.includes('yarn.lock')) return 'yarn';
-  return 'npm';
+  let directory = projectDirectory(manifest);
+  while (true) {
+    const has = (name: string) => Object.prototype.hasOwnProperty.call(files, [directory, name].filter(Boolean).join('/'));
+    if (has('pnpm-lock.yaml')) return 'pnpm';
+    if (has('yarn.lock')) return 'yarn';
+    if (has('package-lock.json')) return 'npm';
+    if (!directory) return 'npm';
+    directory = projectDirectory(directory);
+  }
 }
 function projectDirectory(file: string): string { const index = file.lastIndexOf('/'); return index < 0 ? '' : file.slice(0, index); }
 function packageScriptArgs(manager: string, manifest: string, script: string): string[] {
@@ -103,15 +109,16 @@ export function discoverProjectVerification(manifests: ProjectPackageManifest[],
   const inspected = new Set<string>(Object.keys(files));
   for (const manifest of manifests) {
     const scripts = Object.fromEntries(Object.entries(manifest.scripts).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
-    const manager = packageManager(manifest.path, files);\n    const manager = packageManager(manifest.path, files);
+    const manager = packageManager(manifest.path, files);
     for (const category of selected) {
-      const name = aliases[category].find(candidate => Object.prototype.hasOwnProperty.call(scripts, candidate));
-      if (!name) continue;
-      if (isUnsafeVerificationScript(name, scripts[name], scripts)) {
-        skippedUnsafe.push({ project: manifest.path, script: name, reason: 'The script or one of its delegated/lifecycle scripts appears to perform installation, deployment, publishing, release, migration, or destructive work.' });
-        continue;
+      for (const name of aliases[category].filter(candidate => Object.prototype.hasOwnProperty.call(scripts, candidate))) {
+        if (isUnsafeVerificationScript(name, scripts[name], scripts)) {
+          skippedUnsafe.push({ project: manifest.path, script: name, reason: 'The script or one of its delegated/lifecycle scripts appears unsafe or could not be inspected safely.' });
+          continue;
+        }
+        commands.push({ category, command: manager, args: packageScriptArgs(manager, manifest.path, name), project: manifest.path, source: 'package-script', script: name });
+        break;
       }
-      commands.push({ category, command: manager, args: packageScriptArgs(manager, manifest.path, name), project: manifest.path, source: 'package-script', script: name });
     }
   }
   for (const item of configCommands(files).filter(item => selected.includes(item.category))) {

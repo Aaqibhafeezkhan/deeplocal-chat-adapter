@@ -333,15 +333,30 @@ async function getWorkspaceSummary(folder: vscode.WorkspaceFolder): Promise<stri
 }
 
 async function unsafeDelegatedPackageScript(command: string, args: string[], folder: vscode.WorkspaceFolder): Promise<boolean> {
-  const executable = path.basename(command).toLowerCase().replace(/\.cmd$|\.exe$/i, '');
+  const executable = command.split(/[\\/]/).at(-1)!.toLowerCase().replace(/\.(?:cmd|exe|bat)$/i, '');
+  // Shell wrappers can hide both the package manager and its target directory.
+  // Ask rather than treating their opaque command text as a safe executable.
+  if (['cmd', 'powershell', 'pwsh', 'sh', 'bash', 'zsh', 'fish'].includes(executable)) return true;
   if (!['npm', 'pnpm', 'yarn'].includes(executable)) return false;
-  const scriptIndex = args.findIndex((value, index) => value === 'run' && index + 1 < args.length);
-  if (scriptIndex < 0) return false;
-  const script = args[scriptIndex + 1];
   let directory = folder.uri;
-  const directoryFlag = executable === 'pnpm' ? '--dir' : executable === 'yarn' ? '--cwd' : '--prefix';
-  const flagIndex = args.indexOf(directoryFlag);
-  if (flagIndex >= 0 && args[flagIndex + 1]) directory = vscode.Uri.joinPath(folder.uri, args[flagIndex + 1]);
+  const invocation: string[] = [];
+  const directoryFlags = ['--prefix', '--dir', '--cwd', '-C'];
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index];
+    if (argument === '--') break;
+    const flag = directoryFlags.find(value => argument === value || argument.startsWith(value + '='));
+    if (flag) {
+      const target = argument.startsWith(flag + '=') ? argument.slice(flag.length + 1) : args[++index];
+      if (!target) return true;
+      directory = vscode.Uri.file(path.resolve(folder.uri.fsPath, target));
+    } else if (!['--silent', '-s'].includes(argument)) invocation.push(argument);
+  }
+  if (!isInWorkspace(directory, folder)) return true;
+  if (invocation.length === 1 && ['--version', '-v', '--help', '-h'].includes(invocation[0])) return false;
+  const script = ['run', 'run-script'].includes(invocation[0]) ? invocation[1]
+    : executable !== 'npm' || ['test', 'start', 'stop', 'restart'].includes(invocation[0]) ? invocation[0] : undefined;
+  // Unknown invocations (install, exec, unsupported options, etc.) need approval.
+  if (!script || script.startsWith('-')) return true;
   try {
     const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(directory, 'package.json'));
     const manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as { scripts?: Record<string, unknown> };
@@ -374,7 +389,7 @@ async function getProjectVerificationCommands(folder: vscode.WorkspaceFolder): P
       // Skip malformed or unreadable metadata; do not guess its scripts.
     }
   }
-  const preferences = vscode.workspace.getConfiguration('deeplocal').get<string[]>('verificationPreferences', []);
+  const preferences = vscode.workspace.getConfiguration('deeplocal', folder.uri).get<string[]>('verificationPreferences', []);
   return JSON.stringify(discoverProjectVerification(manifests, files, preferences), null, 2);
 }
 
@@ -660,9 +675,11 @@ async function runCommand(callId: string, args: Record<string, unknown>, options
     return { ...result(callId, 'run_command', JSON.stringify(stopped), 'error'), command: stopped };
   }
   const delegatedUnsafe = options.approvalMode === 'safe' && await unsafeDelegatedPackageScript(command, commandArgs, folder);
+  options.signal?.throwIfAborted();
+  requireWorkspaceFolder(folder);
   const message = `Run command: ${command} ${commandArgs.join(' ')}?`;
   const ok = delegatedUnsafe
-    ? (options.approve ? await options.approve(`${message}\nThe selected package script delegates to unsafe work.`, undefined) : await confirm(`${message}\nThe selected package script delegates to unsafe work.`))
+    ? (options.approve ? await options.approve(`${message}\nThe package command or shell wrapper is unsafe or could not be inspected safely.`, undefined) : await confirm(`${message}\nThe package command or shell wrapper is unsafe or could not be inspected safely.`))
     : await approveIfNeeded('run_command', args, message, options);
   options.signal?.throwIfAborted();
   if (!ok) {

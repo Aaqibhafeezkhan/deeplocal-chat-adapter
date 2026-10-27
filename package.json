@@ -126,6 +126,7 @@
         },
         "deeplocal.verificationPreferences": {
           "type": "array",
+          "scope": "resource",
           "default": [],
           "uniqueItems": true,
           "items": { "type": "string", "enum": ["lint", "typecheck", "build", "test"] },
