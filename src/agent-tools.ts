@@ -7,6 +7,7 @@ import { isInWorkspace, requireWorkspaceFolder, workspaceRelativePath } from './
 import { findNewDuplicateImports, isTypeScriptPath } from './import-validation';
 import { beginEditValidation, DiagnosticObservation, EditValidation } from './edit-validation';
 import { executeCommand, commandSucceeded, CommandResult } from './command-runner';
+import { discoverProjectVerification, isUnsafeVerificationScript, type ProjectPackageManifest } from './project-verification';
 
 // Upper bounds for caller-supplied limits; defaults sit below these.
 const MAX_TEXT_CHARS = 60000;
@@ -185,6 +186,14 @@ export function getAgentTools(): ChatTool[] {
     {
       type: 'function',
       function: {
+        name: 'discover_verification_commands',
+        description: 'Inspect project manifests and configuration to discover existing, relevant lint, type-check, build, and test commands. This tool only reports candidates; it never executes them. Respects deeplocal.verificationPreferences and reports missing or unsafe checks.',
+        parameters: { type: 'object', properties: {} },
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: 'run_command',
         description: 'Run a command in the workspace. Returns JSON with separate stdout/stderr, exitCode or signal, durationMs, error and timeout/cancellation/output-limit/truncation flags, including on failure. Permission behavior follows the selected approval mode.',
         parameters: {
@@ -239,6 +248,8 @@ async function invokeWorkspaceTool(name: string, args: Record<string, unknown>, 
   switch (name) {
     case 'get_workspace_summary':
       return await getWorkspaceSummary(folder);
+    case 'discover_verification_commands':
+      return await getProjectVerificationCommands(folder);
     case 'get_active_file':
       return getActiveFile(folder);
     case 'get_selection':
@@ -286,7 +297,7 @@ function sensitivePath(value: string): boolean {
 
 function unsafeCommand(command: string, args: string[]): boolean {
   const value = `${command} ${args.join(' ')}`.toLowerCase();
-  return /\b(rm|rmdir|del|format|shutdown|reboot|sudo|chmod|chown|curl|wget|ssh|scp|git)\b|\b(install|publish|push|commit|reset|clean|checkout|delete|remove|drop|truncate)\b/.test(value);
+  return /\b(rm|rmdir|del|format|shutdown|reboot|sudo|chmod|chown|curl|wget|ssh|scp|git)\b|\b(install|publish|push|commit|reset|clean|checkout|delete|remove|drop|truncate|deploy|release|migrate|destroy)\b|\b(terraform\s+apply|kubectl\s+delete|docker\s+push)\b/.test(value);
 }
 
 async function approveIfNeeded(name: string, args: Record<string, unknown>, message: string, options: AgentToolOptions, preview?: () => Promise<void>): Promise<boolean> {
@@ -319,6 +330,52 @@ async function getWorkspaceSummary(folder: vscode.WorkspaceFolder): Promise<stri
   }
 
   return lines.join('\n');
+}
+
+async function unsafeDelegatedPackageScript(command: string, args: string[], folder: vscode.WorkspaceFolder): Promise<boolean> {
+  const executable = path.basename(command).toLowerCase().replace(/\.cmd$|\.exe$/i, '');
+  if (!['npm', 'pnpm', 'yarn'].includes(executable)) return false;
+  const scriptIndex = args.findIndex((value, index) => value === 'run' && index + 1 < args.length);
+  if (scriptIndex < 0) return false;
+  const script = args[scriptIndex + 1];
+  let directory = folder.uri;
+  const directoryFlag = executable === 'pnpm' ? '--dir' : executable === 'yarn' ? '--cwd' : '--prefix';
+  const flagIndex = args.indexOf(directoryFlag);
+  if (flagIndex >= 0 && args[flagIndex + 1]) directory = vscode.Uri.joinPath(folder.uri, args[flagIndex + 1]);
+  try {
+    const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(directory, 'package.json'));
+    const manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as { scripts?: Record<string, unknown> };
+    const scripts = Object.fromEntries(Object.entries(manifest.scripts ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+    if (!Object.prototype.hasOwnProperty.call(scripts, script)) return true;
+    return isUnsafeVerificationScript(script, scripts[script], scripts);
+  } catch {
+    return true;
+  }
+}
+
+async function getProjectVerificationCommands(folder: vscode.WorkspaceFolder): Promise<string> {
+  const candidates = (await vscode.workspace.findFiles(
+    new vscode.RelativePattern(folder, '**/{package.json,pyproject.toml,pytest.ini,mypy.ini,tox.ini,setup.cfg,Cargo.toml,go.mod,composer.json,pom.xml,build.gradle,build.gradle.kts,gradlew,gradlew.bat,Makefile,package-lock.json,pnpm-lock.yaml,yarn.lock}'),
+    '**/{node_modules,.git,dist,out,vendor,target}/**',
+    100,
+  )).filter(file => isInWorkspace(file, folder));
+  const files: Record<string, string> = {};
+  const manifests: ProjectPackageManifest[] = [];
+  for (const file of candidates) {
+    const relative = workspaceRelativePath(file, folder);
+    try {
+      const content = new TextDecoder('utf-8', { fatal: true }).decode(await vscode.workspace.fs.readFile(file));
+      files[relative] = content;
+      if (path.posix.basename(relative) === 'package.json') {
+        const parsed = JSON.parse(content) as { scripts?: Record<string, unknown> };
+        manifests.push({ path: relative, scripts: parsed.scripts ?? {} });
+      }
+    } catch {
+      // Skip malformed or unreadable metadata; do not guess its scripts.
+    }
+  }
+  const preferences = vscode.workspace.getConfiguration('deeplocal').get<string[]>('verificationPreferences', []);
+  return JSON.stringify(discoverProjectVerification(manifests, files, preferences), null, 2);
 }
 
 function getActiveFile(folder: vscode.WorkspaceFolder): string {
@@ -602,8 +659,11 @@ async function runCommand(callId: string, args: Record<string, unknown>, options
     const stopped = await executeCommand(command, commandArgs, folder.uri.fsPath, options.signal);
     return { ...result(callId, 'run_command', JSON.stringify(stopped), 'error'), command: stopped };
   }
+  const delegatedUnsafe = options.approvalMode === 'safe' && await unsafeDelegatedPackageScript(command, commandArgs, folder);
   const message = `Run command: ${command} ${commandArgs.join(' ')}?`;
-  const ok = await approveIfNeeded('run_command', args, message, options);
+  const ok = delegatedUnsafe
+    ? (options.approve ? await options.approve(`${message}\nThe selected package script delegates to unsafe work.`, undefined) : await confirm(`${message}\nThe selected package script delegates to unsafe work.`))
+    : await approveIfNeeded('run_command', args, message, options);
   options.signal?.throwIfAborted();
   if (!ok) {
     return result(callId, 'run_command', 'User declined command execution.');
